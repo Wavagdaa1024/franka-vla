@@ -1,0 +1,10 @@
+{
+  "mode": "eye_to_hand",
+  "camera_serial": "254322072252",
+  "depth_scale_m_per_unit": 0.001,
+  "intrinsics": {"fx": 0.0, "fy": 0.0, "cx": 0.0, "cy": 0.0},
+  "camera_to_base": [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],
+  "workspace_bounds_m": [[0.20,0.80],[-0.40,0.40],[0.02,0.60]],
+  "obstacle_clearance_m": 0.10,
+  "status": "PLACEHOLDER_REQUIRES_CHARUCO_CALIBRATION"
+}

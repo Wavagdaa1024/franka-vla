@@ -1,0 +1,44 @@
+# Checkpoints & Model Weights
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# Datasets & Recorded Data
+dataset/
+data/
+outputs/
+*.parquet
+*.mp4
+*.h5
+*.hdf5
+*.pkl
+*.npy
+*.npz
+
+# Python & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Experiment Tracking
+wandb/
+runs/
+.cache/
+
+# IDE & OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
