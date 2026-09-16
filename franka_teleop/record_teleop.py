@@ -29,7 +29,7 @@ FRONT_SERIAL = "254322072252"
 WRIST_SERIAL = "348122070854"
 # Dataset storage must be chosen explicitly; never reuse a Linux path on Windows.
 GRIPPER_MAX_WIDTH_M = 0.08
-GRIPPER_WIDTH_TOLERANCE_M = 0.001
+GRIPPER_WIDTH_TOLERANCE_M = 0.006  # Franka Hand open can read ~0.081m due to mechanical pads/calibration
 
 
 def _finite_vector(message: dict[str, Any], key: str, length: int) -> list[float]:

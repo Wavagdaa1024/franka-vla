@@ -37,8 +37,8 @@ def validate_state(message: dict[str, Any]) -> dict[str, Any]:
     _vector(message, "dq", 7)
     _vector(message, "O_T_EE", 16)
     width = message.get("gripper_width_m")
-    if width is not None and (not math.isfinite(float(width)) or not 0.0 <= float(width) <= 0.08):
-        raise ValueError("gripper_width_m must be null or within [0, 0.08]")
+    if width is not None and (not math.isfinite(float(width)) or not -0.006 <= float(width) <= 0.086):
+        raise ValueError("gripper_width_m must be null or within [-0.006, 0.086]")
     return message
 
 

@@ -43,11 +43,20 @@ roslaunch franka_example_controllers \
   robot_ip:=172.16.0.2
 ```
 
+### 2.3 回到初始位置
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/ssui/franka_ros_ws/catkin_ws2/devel/setup.bash
+
+roslaunch franka_example_controllers move_to_start.launch robot_ip:=172.16.0.2
+```
+
 ---
 
 ## 3. 终端 2：Franka 控制电脑，启动 Franka 控制器和夹爪
 
 打开控制机终端 2，运行：
+
 
 ```bash
 source /opt/ros/noetic/setup.bash
@@ -73,7 +82,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py
   --action-space droid_joint_delta `
   --task "pick and place the red cube" `
   --repo-id local/franka_red_cube `
-  --root "C:\Users\74727\Desktop\project\VLA_franka\dataset\teleop_pick_cube_15hz_001" `
+  --root "C:\Users\74727\Desktop\project\VLA_franka\dataset\teleop_pick_cube_15hz_002" `
   --front-serial 254322072252 `
   --wrist-serial 348122070854 `
   --fps 15 `
