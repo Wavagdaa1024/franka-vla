@@ -4,35 +4,23 @@
 
 ## 目录结构
 
-VLA_franka/
-├── lerobot/          # 【官方核心库】直接 Clone / Submodule
-│
-├── franka_teleop/    # 【自己的一级业务】Franka 机械臂驱动、双相机流、遥操作录制与闭环
-├── vlm_planning/     # 【自己的一级业务】RoboBrain / Qwen 任务规划与空间坐标标定
-│
-├── scripts/          # 【日常运行入口】一键录制、一键训练、一键实机启动
-├── tests/            # 【自检与测试】移到这里（原 sanity_checks：相机检查、限位测试、影子运行）
-├── docs/             # 【接口与架构文档】
-│
-├── dataset/          # 【数据集】
-└── checkpoints/      # 【模型权重】
+- **`lerobot/`**：官方原生核心库，提供 Policy（PI0, ACT, Diffusion, SmolVLA 等）与标准数据集。
+- **`franka_teleop/`**：机械臂驱动、双相机流与 LeRobot 数据采集。
+- **`vlm_planning/`**：RoboBrain / Qwen 任务规划与空间坐标映射。
+- **`scripts/`**：快捷命令入口（绑定 GPU 1 与 Conda 环境）。
+- **`tests/`**：安全门禁、相机检测与 GPU 1 影子运行自检。
+- **`docs/`**：详尽接口文档（`docs/SCRIPTS_AND_INTERFACES.md`）。
+- **`checkpoints/`**：预训练模型权重。
+- **`dataset/`**：LeRobot 格式轨迹数据集。
 
-## 快速使用
+## 快速使用与实机运行
 
-### 1. 验证模型资产与安全门禁
-```bash
-python tests/check_assets.py
-python tests/check_safety_guards.py
-```
+详细的多终端（Franka 控制机 + Windows GPU 录制端/推理端）端到端实机操作手册请参阅：  
+👉 **[快速使用与实机运行指南 (QUICK_START.md)](QUICK_START.md)**
 
-### 2. 离线影子运行 (GPU 1)
-```bash
-scripts\\launch_shadow_run.bat
-```
+- **数据采集**：涵盖 ROS 阻抗控制、Touch 遥操作手柄控制以及 LeRobot 双相机流同步录制规范。
+- **实机部署**：涵盖 1kHz 关节速度底层、闭环执行服务与 Windows VLA 推理 Agent。
+- **自检测试**：资产检查与 GPU 1 影子运行自检。
 
-### 3. 数据采集 (LeRobot 格式)
-```bash
-scripts\\launch_record.bat --repo_id teleop_pick_cube_15hz_001
-```
-
-详见 [docs/SCRIPTS_AND_INTERFACES.md](docs/SCRIPTS_AND_INTERFACES.md)。
+各自研模块、类接口与 Python API 说明请参阅：  
+👉 **[自研脚本与接口规格说明书 (docs/SCRIPTS_AND_INTERFACES.md)](docs/SCRIPTS_AND_INTERFACES.md)**
