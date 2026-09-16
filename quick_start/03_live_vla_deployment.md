@@ -1,6 +1,6 @@
 # 教程 03：实机闭环 VLA 部署四步法 (03_live_vla_deployment.md)
 
-本教程指导如何将训练好的 VLA 模型（如 Pi0.5 / DROID）接入实机 Franka 机械臂，进行闭环自主推理与抓取控制。
+本教程指导如何将训练好的 VLA 模型（如微调好的 Pi0.5 / DROID jointpos 模型）接入实机 Franka 机械臂，进行闭环自主推理与抓取控制。
 
 ---
 
@@ -53,15 +53,15 @@ set CUDA_VISIBLE_DEVICES=1
 
 C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\closed_loop_franka.py ^
   --profile jointpos ^
-  --checkpoint checkpoints\pi05_droid\action_expert_final.pt ^
+  --checkpoint outputs\checkpoints\action_expert_final.pt ^
   --task "pick and place the red cube" ^
   --live
 ```
 
 ### 技巧：如何切换模型与任务对比测试？
-- **测试不同 checkpoint（如 Step 500 模型）**：
+- **测试不同微调 checkpoint（如 Step 500 模型）**：
   ```cmd
-  scripts\launch_live_agent.bat --live --checkpoint checkpoints\pi05_droid\action_expert_step500.pt --task "pick up the blue block and place it in the brown basket"
+  scripts\launch_live_agent.bat --live --checkpoint outputs\checkpoints\action_expert_step500.pt --task "pick up the blue block and place it in the brown basket"
   ```
 - **切换抓取目标**：只需修改 `--task` 参数，例如：`--task "pick and place the red cube"`。
 

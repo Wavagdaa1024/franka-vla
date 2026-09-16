@@ -6,7 +6,6 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKPOINTS_DIR = ROOT / "checkpoints"
 
 REQUIRED_ASSETS = [
-    ("pi05_droid", CHECKPOINTS_DIR / "pi05_droid"),
     ("pi05_droid_jointpos", CHECKPOINTS_DIR / "pi05_droid_jointpos"),
     ("Qwen3.5-9B", CHECKPOINTS_DIR / "Qwen3.5-9B"),
     ("RoboBrain2.5-8B-NV", CHECKPOINTS_DIR / "RoboBrain2.5-8B-NV"),
@@ -24,7 +23,7 @@ def main():
         else:
             print(f"[FAIL] {name:<22}: MISSING at {path}")
             all_ok = False
-    
+
     print("-" * 60)
     if all_ok:
         print("[ALL PASS] All required model checkpoints and assets are present.")

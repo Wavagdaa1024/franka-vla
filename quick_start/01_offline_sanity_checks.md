@@ -15,7 +15,6 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\check_assets.py
 
 - **预期输出**：
   ```text
-  [PASS] pi05_droid            : Found (10 files)
   [PASS] pi05_droid_jointpos   : Found (10 files)
   [PASS] Qwen3.5-9B            : Found (17 files)
   [PASS] RoboBrain2.5-8B-NV    : Found (16 files)

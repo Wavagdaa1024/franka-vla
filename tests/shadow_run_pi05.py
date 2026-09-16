@@ -55,8 +55,8 @@ def main():
     # 2. Asset Paths
     SCRIPT_DIR = Path(__file__).resolve().parent
     REPO_ROOT = SCRIPT_DIR.parent
-    CHECKPOINT_DIR = REPO_ROOT / "checkpoints" / "pi05_droid"
-    STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_norm_stats.json"
+    CHECKPOINT_DIR = REPO_ROOT / "checkpoints" / "pi05_droid_jointpos"
+    STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_jointpos_norm_stats.json"
     TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
     
     FRONT_CAM_PATH = SCRIPT_DIR / "assets" / "front_camera.jpg"
@@ -80,7 +80,7 @@ def main():
 
     # 3. Load Model and Measure Timings & Memory
     print("-" * 70)
-    print("Loading Pi0.5 DROID Model to GPU 1...")
+    print("Loading Pi0.5 DROID Jointpos Model to GPU 1...")
     t0 = time.perf_counter()
     vram_before_load = torch.cuda.memory_allocated(0)
 
@@ -89,7 +89,7 @@ def main():
         stats_path=STATS_PATH,
         tokenizer_path=TOKENIZER_PATH,
         device=target_device,
-        profile="droid"
+        profile="droid_jointpos"
     )
 
     torch.cuda.synchronize()
