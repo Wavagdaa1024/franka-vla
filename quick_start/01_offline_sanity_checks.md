@@ -1,6 +1,6 @@
 # 教程 01：前置自检与离线测试 (01_offline_sanity_checks.md)
 
-本教程指导在正式连接机械臂前，如何在 Windows GPU 服务器上完成资产自检、安全门禁单元测试以及离线影子运行。
+本教程指导在正式连接机械臂前，如何在 Windows GPU 服务器上完成资产自检、安全门禁单元测试、数据集完整性校验以及离线影子运行。
 
 ---
 
@@ -41,7 +41,38 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\check_safety_guards.py
 
 ---
 
-## 3. 运行 GPU 1 单卡隔离影子推理自检 (Shadow Run)
+## 3. 验证本地数据集 LeRobot 官方兼容性
+
+自动校验 `dataset/` 目录下所有数据集的分块视频文件、Parquet 元数据及 `meta/info.json`：
+
+```cmd
+cd /d C:\Users\74727\Desktop\project\VLA_franka
+C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\check_datasets.py
+```
+
+- **预期输出**：
+  ```text
+  ============================================================
+    LeRobot Dataset Compliance Verification
+  ============================================================
+  --> Validating teleop_pick_cube_15hz_001...
+      Episodes : 28
+      Frames   : 4301 (FPS: 15)
+      Features : ['observation.state', 'action', 'observation.images.front', 'observation.images.wrist', ...]
+  [PASS] teleop_pick_cube_15hz_001: 100% LeRobotDataset compliant.
+
+  --> Validating teleop_pick_vegetables_15hz_001...
+      Episodes : 27
+      Frames   : 4471 (FPS: 15)
+      Features : ['observation.state', 'action', 'observation.images.front', 'observation.images.wrist', ...]
+  [PASS] teleop_pick_vegetables_15hz_001: 100% LeRobotDataset compliant.
+  ------------------------------------------------------------
+  [ALL PASS] All checked datasets are 100% valid and ready for training.
+  ```
+
+---
+
+## 4. 运行 GPU 1 单卡隔离影子推理自检 (Shadow Run)
 
 使用本地保存的真实双相机测试帧与 Franka 初始位姿，执行离线推理测试。  
 **核心特性**：严格限制在物理 GPU 1，物理 GPU 0 绝对零占用，仅推理不下发实机动作。
