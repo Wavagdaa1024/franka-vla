@@ -9,7 +9,7 @@
 本工程遵循**与 LeRobot 官方库解耦并列**的架构原则：
 1. **`lerobot/`**：官方克隆源码，负责 Policy 模型定义（PI0, ACT, Diffusion, SmolVLA 等）、LeRobotDataset 标准格式、官方训练循环与评测器。
 2. **`franka_teleop/`**：机器人与传感器交互层，负责将真实世界（RealSense 相机、Franka 机械臂遥测）与 LeRobotDataset 或 Policy.select_action 桥接。
-3. **`sanity_checks/`**：安全防护与自检套件，确保实机动作前资产完备、相机畅通、离线数值合规（强制单卡 GPU 1 隔离）。
+3. **`tests/`**：安全防护与自检套件，确保实机动作前资产完备、相机畅通、离线数值合规（强制单卡 GPU 1 隔离）。
 4. **`vlm_planning/`**：任务规划层，负责高层任务拆解与物体定位，为底层 VLA 提供任务文本和目标路点。
 
 ---
@@ -64,19 +64,19 @@
 
 ---
 
-### 2. `sanity_checks` 模块
+### 2. `tests` 模块
 
 #### (1) `check_assets.py`
 - **功能**：自检所有预训练模型、分词器、统计量资产是否就绪。
-- **运行**：`python sanity_checks/check_assets.py`。
+- **运行**：`python tests/check_assets.py`。
 
 #### (2) `check_safety_guards.py`
 - **功能**：安全门禁单元测试，验证限位、限幅和超时拦截逻辑。
-- **运行**：`python sanity_checks/check_safety_guards.py`。
+- **运行**：`python tests/check_safety_guards.py`。
 
 #### (3) `check_cameras.py`
 - **功能**：检测 RealSense 双相机连通性、帧率与图像数据形状。
-- **运行**：`python sanity_checks/check_cameras.py`。
+- **运行**：`python tests/check_cameras.py`。
 
 #### (4) `shadow_run_pi05.py`
 - **功能**：单卡物理 GPU 1 隔离离线推理影子运行，校验策略推理时延与动作输出。

@@ -4,21 +4,25 @@
 
 ## 目录结构
 
-- **`lerobot/`**：官方原生核心库，提供 Policy（PI0, ACT, Diffusion, SmolVLA 等）与标准数据集。
-- **`franka_teleop/`**：机械臂驱动、双相机流与 LeRobot 数据采集。
-- **`sanity_checks/`**：安全门禁、相机检测与 GPU 1 影子运行自检。
-- **`vlm_planning/`**：RoboBrain / Qwen 任务规划与空间坐标映射。
-- **`scripts/`**：快捷命令入口（绑定 GPU 1 与 Conda 环境）。
-- **`docs/`**：详尽接口文档（`docs/SCRIPTS_AND_INTERFACES.md`）。
-- **`checkpoints/`**：预训练模型权重。
-- **`dataset/`**：LeRobot 格式轨迹数据集。
+VLA_franka/
+├── lerobot/          # 【官方核心库】直接 Clone / Submodule
+│
+├── franka_teleop/    # 【自己的一级业务】Franka 机械臂驱动、双相机流、遥操作录制与闭环
+├── vlm_planning/     # 【自己的一级业务】RoboBrain / Qwen 任务规划与空间坐标标定
+│
+├── scripts/          # 【日常运行入口】一键录制、一键训练、一键实机启动
+├── tests/            # 【自检与测试】移到这里（原 sanity_checks：相机检查、限位测试、影子运行）
+├── docs/             # 【接口与架构文档】
+│
+├── dataset/          # 【数据集】
+└── checkpoints/      # 【模型权重】
 
 ## 快速使用
 
 ### 1. 验证模型资产与安全门禁
 ```bash
-python sanity_checks/check_assets.py
-python sanity_checks/check_safety_guards.py
+python tests/check_assets.py
+python tests/check_safety_guards.py
 ```
 
 ### 2. 离线影子运行 (GPU 1)

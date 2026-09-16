@@ -20,4 +20,4 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["franka_teleop*", "sanity_checks*", "vlm_planning*"]
+include = ["franka_teleop*", "vlm_planning*"]

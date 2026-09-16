@@ -18,7 +18,7 @@
 |   * act, diff     |                           | |  - live_guards      | |
 | - datasets/       | <=======================  | |  - realsense_stream | |
 |   * LeRobotDataset| (Standard Data Contract)  | +---------------------+ |
-| - scripts/        |                           | |    sanity_checks    | |
+| - scripts/        |                           | |    tests    | |
 |   * train.py      |                           | |  - shadow_run_gpu1  | |
 |   * eval.py       |                           | |  - check_cameras    | |
 +-------------------+                           | +---------------------+ |
