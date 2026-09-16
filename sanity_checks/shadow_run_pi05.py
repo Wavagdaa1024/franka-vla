@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-M3 Step 2: Pi0.5 Shadow Run Benchmark on GPU 1.
+VLA_franka: Pi0.5 DROID Standalone Shadow Run on GPU 1.
 Strict isolation: Physical GPU 1 only. Never touches GPU 0.
-Supports both Joint Position (jointpos) and Joint Velocity (droid) action spaces.
 Never commands physical robot motion (shadow evaluation only).
 """
 
@@ -10,7 +9,6 @@ import os
 import sys
 import time
 import json
-import argparse
 from pathlib import Path
 
 # Enforce strict GPU 1 isolation BEFORE importing torch
@@ -22,16 +20,9 @@ import torch
 import numpy as np
 from PIL import Image
 
-# Add src to sys.path
-SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent
-MYCODE_SRC = PROJECT_ROOT / "src"
-if str(MYCODE_SRC) not in sys.path:
-    sys.path.insert(0, str(MYCODE_SRC))
-
-from midterm_robot.vla.pi05.runtime import PI05Inference
-from midterm_robot.vla.pi05.config import PI05Config
-from midterm_robot.vla.live_guards import validate_joint_velocity_chunk, validate_joint_position_chunk
+# Import engine from local package
+from franka_teleop.pi05_engine.runtime import PI05Inference
+from franka_teleop.pi05_engine.config import PI05Config
 
 
 def format_bytes(b: int) -> str:
@@ -39,14 +30,8 @@ def format_bytes(b: int) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Pi0.5 Shadow Run Benchmark")
-    parser.add_argument("--profile", choices=["jointpos", "droid"], default="jointpos",
-                        help="Action profile: jointpos (Joint Position, default) or droid (Joint Velocity)")
-    parser.add_argument("--checkpoint", default=None, help="Custom path to checkpoint directory")
-    args = parser.parse_args()
-
     print("=" * 70)
-    print(f"M3 Step 2: Pi0.5 Shadow Run ({args.profile.upper()} MODE on GPU 1)")
+    print("VLA_franka: Pi0.5 DROID Standalone Shadow Run (GPU 1 Isolation)")
     print("=" * 70)
 
     # 1. Device and Safety Checks
@@ -68,29 +53,18 @@ def main():
     torch.cuda.reset_peak_memory_stats(0)
 
     # 2. Asset Paths
-    REPO_ROOT = PROJECT_ROOT
-    if args.profile == "jointpos":
-        CHECKPOINT_DIR = Path(args.checkpoint) if args.checkpoint else REPO_ROOT / "checkpoints" / "pi05_droid_jointpos"
-        STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_jointpos_norm_stats.json"
-        TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
-        profile_name = "droid_jointpos"
-    else:
-        CHECKPOINT_DIR = Path(args.checkpoint) if args.checkpoint else REPO_ROOT / "checkpoints" / "pi05_droid"
-        STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_norm_stats.json"
-        TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
-        profile_name = "droid"
+    SCRIPT_DIR = Path(__file__).resolve().parent
+    REPO_ROOT = SCRIPT_DIR.parent
+    CHECKPOINT_DIR = REPO_ROOT / "checkpoints" / "pi05_droid"
+    STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_norm_stats.json"
+    TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
     
-    candidates = [
-        PROJECT_ROOT / "outputs" / "camera_snapshots",
-        PROJECT_ROOT / "target_mode" / "outputs" / "camera_snapshots",
-    ]
-    snap_dir = next((c for c in candidates if (c / "front_camera.jpg").is_file()), candidates[0])
-    FRONT_CAM_PATH = snap_dir / "front_camera.jpg"
-    WRIST_CAM_PATH = snap_dir / "wrist_camera.jpg"
+    FRONT_CAM_PATH = SCRIPT_DIR / "assets" / "front_camera.jpg"
+    WRIST_CAM_PATH = SCRIPT_DIR / "assets" / "wrist_camera.jpg"
     
-    OUTPUT_DIR = PROJECT_ROOT / "outputs"
+    OUTPUT_DIR = REPO_ROOT / "outputs"
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_JSON = OUTPUT_DIR / f"m3_shadow_run_{args.profile}.json"
+    OUTPUT_JSON = OUTPUT_DIR / "m3_shadow_run.json"
 
     print(f"[Assets] Checkpoint: {CHECKPOINT_DIR}")
     print(f"[Assets] Stats:      {STATS_PATH}")
@@ -106,7 +80,7 @@ def main():
 
     # 3. Load Model and Measure Timings & Memory
     print("-" * 70)
-    print(f"Loading Pi0.5 ({profile_name}) Model to GPU 1...")
+    print("Loading Pi0.5 DROID Model to GPU 1...")
     t0 = time.perf_counter()
     vram_before_load = torch.cuda.memory_allocated(0)
 
@@ -115,7 +89,7 @@ def main():
         stats_path=STATS_PATH,
         tokenizer_path=TOKENIZER_PATH,
         device=target_device,
-        profile=profile_name
+        profile="droid"
     )
 
     torch.cuda.synchronize()
@@ -129,16 +103,15 @@ def main():
 
     # 4. Prepare Observations
     print("-" * 70)
-    print("Preparing Real Camera Observations & Franka Initial State...")
+    print("Preparing Camera Observations & Franka Initial State...")
 
     front_img = Image.open(FRONT_CAM_PATH).convert("RGB")
     wrist_img = Image.open(WRIST_CAM_PATH).convert("RGB")
     print(f"[Input Cameras] Front: {front_img.size} ({front_img.mode}), Wrist: {wrist_img.size} ({wrist_img.mode})")
 
-    front_chw = torch.from_numpy(np.transpose(np.array(front_img), (2, 0, 1)))  # uint8, (3, H, W)
-    wrist_chw = torch.from_numpy(np.transpose(np.array(wrist_img), (2, 0, 1)))  # uint8, (3, H, W)
+    front_chw = torch.from_numpy(np.transpose(np.array(front_img), (2, 0, 1)))
+    wrist_chw = torch.from_numpy(np.transpose(np.array(wrist_img), (2, 0, 1)))
 
-    # Franka standard ready joint configuration (radians) + gripper (0 = closed, 1 = open)
     franka_ready_state = np.array(
         [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398, 0.0],
         dtype=np.float32
@@ -153,122 +126,96 @@ def main():
 
     # 5. Benchmark Tasks
     tasks_to_test = [
-        ("Blue_Cube_Pick", "pick and place the blue cube"),
-        ("Blue_Cube_SubSkill", "pick up the blue block"),
-        ("Onion_Full", "pick up the purple onion and place it in the brown basket"),
-        ("Pepper_Full", "pick up the green pepper and place it in the brown basket"),
+        ("M0_E1_Full", "pick up the purple onion and place it in the brown basket"),
+        ("M0_SubSkill_Pick", "pick up the purple onion"),
+        ("M0_SubSkill_Place", "place into the brown basket"),
+        ("M0_E2_Full", "pick up the green pepper and place it in the brown basket"),
     ]
 
-    # Warmup Run
     print("-" * 70)
-    print("Executing Warmup Inference on GPU 1...")
-    torch.manual_seed(42)
-    _ = model.predict_action_chunk(observations, "warmup pick")
-    torch.cuda.synchronize()
-    print("[Warmup Done] CUDA kernels initialized.")
+    print(f"Executing Shadow Runs on GPU 1 across {len(tasks_to_test)} instructions...")
 
-    # Main Inference Runs
-    print("-" * 70)
-    print(f"Executing Shadow Run Benchmark Across Instructions ({args.profile.upper()})...")
-    results = {
+    results = []
+    
+    # Warm-up run
+    print("[Warm-up] Executing 1 warm-up inference...")
+    _ = model.predict_action_chunk(observations, "warm up run")
+    torch.cuda.synchronize()
+    print("[Warm-up] Complete.")
+
+    for task_id, task_text in tasks_to_test:
+        print(f"\n---> Task [{task_id}]: \"{task_text}\"")
+        torch.cuda.reset_peak_memory_stats(0)
+        
+        t_infer_start = time.perf_counter()
+        action_chunk = model.predict_action_chunk(observations, task_text)
+        torch.cuda.synchronize()
+        infer_latency_ms = (time.perf_counter() - t_infer_start) * 1000.0
+
+        vram_peak = torch.cuda.max_memory_allocated(0)
+        
+        # Verify shape and finite values
+        actions_np = action_chunk.cpu().numpy()  # shape: (1, 15, 8)
+        assert actions_np.shape == (1, 15, 8), f"Unexpected shape {actions_np.shape}"
+        assert np.isfinite(actions_np).all(), "Output contains NaN or Inf!"
+        
+        chunk_0 = actions_np[0]  # (15, 8)
+        first_step = chunk_0[0]
+        last_step = chunk_0[-1]
+        
+        # Gripper values (index 7)
+        g_first = float(first_step[7])
+        g_last = float(last_step[7])
+        
+        print(f"     Latency:     {infer_latency_ms:.1f} ms  (Chunk size: 15 steps @ 30Hz ~ 500ms)")
+        print(f"     Peak VRAM:   {format_bytes(vram_peak)}")
+        print(f"     Step 0  dq:  [{', '.join(f'{v:+.3f}' for v in first_step[:7])}], grip: {g_first:.2f}")
+        print(f"     Step 14 dq:  [{', '.join(f'{v:+.3f}' for v in last_step[:7])}], grip: {g_last:.2f}")
+        
+        results.append({
+            "task_id": task_id,
+            "instruction": task_text,
+            "latency_ms": round(infer_latency_ms, 2),
+            "peak_vram_gb": round(vram_peak / (1024**3), 2),
+            "action_shape": list(actions_np.shape),
+            "all_finite": bool(np.isfinite(actions_np).all()),
+            "first_step_actions": [round(float(x), 4) for x in first_step],
+            "last_step_actions": [round(float(x), 4) for x in last_step],
+        })
+
+    # 6. Overall Metrics
+    latencies = [r["latency_ms"] for r in results]
+    avg_latency = np.mean(latencies)
+    rtf = avg_latency / 500.0
+
+    print("\n" + "=" * 70)
+    print("SHADOW RUN SUMMARY (PHYSICAL GPU 1)")
+    print("=" * 70)
+    print(f"[*] Total Test Cases:      {len(results)}/4")
+    print(f"[*] Average Latency:       {avg_latency:.1f} ms")
+    print(f"[*] Real-Time Factor (RTF):{rtf:.2f} (Target < 1.0; computation is {1.0/rtf:.1f}x faster than physical execution)")
+    print(f"[*] Model Peak Memory:     {format_bytes(torch.cuda.max_memory_reserved(0))}")
+    print(f"[*] Numerical Safety:      100% Finite (0 NaN / 0 Inf)")
+    print("=" * 70)
+
+    summary_payload = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "device": device_name,
-        "gpu_id": 1,
-        "profile": args.profile,
-        "vram_allocated_model": format_bytes(vram_after_load),
-        "vram_reserved_model": format_bytes(vram_reserved),
-        "model_load_time_seconds": round(t_load, 2),
-        "tasks": []
+        "visible_devices": visible_devices,
+        "load_time_s": round(t_load, 2),
+        "vram_load_gb": round(vram_after_load / (1024**3), 2),
+        "vram_peak_gb": round(torch.cuda.max_memory_reserved(0) / (1024**3), 2),
+        "avg_latency_ms": round(float(avg_latency), 2),
+        "rtf": round(float(rtf), 3),
+        "tests": results
     }
 
-    for task_tag, task_prompt in tasks_to_test:
-        print(f"\n---> Testing Task: [{task_tag}] '{task_prompt}'")
-        latencies = []
-        chunks = []
-
-        # Run 3 iterations per task to get stable latency metrics
-        for it in range(3):
-            torch.cuda.reset_peak_memory_stats(0)
-            torch.cuda.synchronize()
-            t_start = time.perf_counter()
-
-            if it == 0:
-                torch.manual_seed(42)
-            action_chunk = model.predict_action_chunk(observations, task_prompt)
-            torch.cuda.synchronize()
-            t_dur = (time.perf_counter() - t_start) * 1000.0  # ms
-            latencies.append(t_dur)
-            chunks.append(action_chunk.numpy())
-
-        # Analyze first run (deterministic)
-        main_chunk = chunks[0]  # shape (1, 15, 8)
-        actions_seq = main_chunk[0]  # (15, 8)
-
-        is_finite = bool(np.isfinite(actions_seq).all())
-        chunk_shape = list(main_chunk.shape)
-        peak_vram = torch.cuda.max_memory_allocated(0)
-
-        gripper_seq = actions_seq[:, 7].tolist()
-
-        if args.profile == "jointpos":
-            delta_q = actions_seq[:, :7]
-            q_current = franka_ready_state[:7]
-            q_targets = q_current[None, :] + delta_q
-            q_targets_valid, gripper_valid = validate_joint_position_chunk(
-                q_targets, actions_seq[:, 7], current_q=q_current
-            )
-            step_0_targets = q_targets_valid[0].tolist()
-            step_14_targets = q_targets_valid[-1].tolist()
-            total_delta = (q_targets_valid[-1] - q_current).tolist()
-
-            print(f"     Latencies (3 runs): {[f'{x:.1f}ms' for x in latencies]}")
-            print(f"     Avg Latency:        {np.mean(latencies):.1f} ms (Min: {np.min(latencies):.1f} ms)")
-            print(f"     Peak VRAM:          {format_bytes(peak_vram)}")
-            print(f"     Target Joints q0:   {[round(q, 3) for q in step_0_targets]}")
-            print(f"     Target Joints q14:  {[round(q, 3) for q in step_14_targets]}")
-            print(f"     Target Delta (14):  {[round(d, 3) for d in total_delta]} rad")
-            print(f"     Gripper Trajectory: {[round(g, 3) for g in gripper_seq]}")
-
-            task_record = {
-                "task_tag": task_tag,
-                "task_prompt": task_prompt,
-                "chunk_shape": chunk_shape,
-                "is_finite": is_finite,
-                "latency_runs_ms": [round(x, 1) for x in latencies],
-                "latency_mean_ms": round(float(np.mean(latencies)), 1),
-                "peak_vram": format_bytes(peak_vram),
-                "step_0_target_q": [round(x, 4) for x in step_0_targets],
-                "step_14_target_q": [round(x, 4) for x in step_14_targets],
-                "total_delta_q": [round(x, 4) for x in total_delta],
-                "gripper_sequence": [round(x, 4) for x in gripper_seq],
-            }
-        else:
-            joint_means = np.mean(actions_seq[:, :7], axis=0).tolist()
-            total_q_delta = (actions_seq[-1, :7] - actions_seq[0, :7]).tolist()
-            print(f"     Latencies (3 runs): {[f'{x:.1f}ms' for x in latencies]}")
-            print(f"     Avg Latency:        {np.mean(latencies):.1f} ms")
-            print(f"     Mean dq (vel):      {[round(x, 3) for x in joint_means]} rad/s")
-            print(f"     Gripper Trajectory: {[round(g, 3) for g in gripper_seq]}")
-
-            task_record = {
-                "task_tag": task_tag,
-                "task_prompt": task_prompt,
-                "chunk_shape": chunk_shape,
-                "is_finite": is_finite,
-                "latency_mean_ms": round(float(np.mean(latencies)), 1),
-                "peak_vram": format_bytes(peak_vram),
-                "joint_means": [round(x, 4) for x in joint_means],
-                "gripper_sequence": [round(x, 4) for x in gripper_seq],
-            }
-
-        results["tasks"].append(task_record)
-
-    # 6. Save Report Artifacts
     with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, ensure_ascii=False)
-    print("\n" + "=" * 70)
-    print(f"[SUCCESS] Shadow run results saved to {OUTPUT_JSON}")
-    print("=" * 70)
+        json.dump(summary_payload, f, indent=2)
+    print(f"[Report] Saved summary to {OUTPUT_JSON}")
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
