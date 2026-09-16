@@ -4,7 +4,7 @@
 
 ---
 
-## 架构数据流图
+## 1. 架构数据流图
 
 ```text
 Franka ROS / 笛卡尔阻抗控制器
@@ -18,11 +18,11 @@ Windows 双相机 + LeRobot 录制器
 
 ---
 
-## 终端 1：Franka 控制电脑，启动 ROS 和底层控制器
+## 2. 终端 1：Franka 控制电脑，启动 ROS 和底层控制器
 
 打开控制机终端 1，运行：
 
-### 1. 阻抗控制底层 (推荐遥操作采集使用)
+### 2.1 阻抗控制底层 (推荐遥操作采集使用)
 ```bash
 source /opt/ros/noetic/setup.bash
 source /home/ssui/franka_ros_ws/catkin_ws2/devel/setup.bash
@@ -32,7 +32,7 @@ roslaunch franka_example_controllers \
   robot_ip:=172.16.0.2
 ```
 
-### 2. 速度控制底层 (备用)
+### 2.2 速度控制底层 (备用)
 ```bash
 source /opt/ros/noetic/setup.bash
 source /home/ssui/franka_ros_ws/catkin_ws2/devel/setup.bash
@@ -45,7 +45,7 @@ roslaunch franka_example_controllers \
 
 ---
 
-## 终端 2：Franka 控制电脑，启动 Franka 控制器和夹爪
+## 3. 终端 2：Franka 控制电脑，启动 Franka 控制器和夹爪
 
 打开控制机终端 2，运行：
 
@@ -59,11 +59,11 @@ python3 Teleop_dataset_recorder.py --sample-hz 15
 
 ---
 
-## 终端 3：Windows 服务器，启动录制端
+## 4. 终端 3：Windows 服务器，启动录制端 (基础完整命令)
 
 打开 Windows GPU 服务器终端（CMD 或 PowerShell）：
 
-### (1) 开始录制新数据集 (不要加 `--resume`)
+### 4.1 开始录制新数据集 (首次录制，不要加 `--resume`)
 ```powershell
 cd C:\Users\74727\Desktop\project\VLA_franka
 
@@ -80,7 +80,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py
   --no-preview
 ```
 
-### (2) 后续向已有目录继续追加录制 (必须加 `--resume`)
+### 4.2 追加录制到已有目录 (后续追加，必须加 `--resume`)
 ```powershell
 cd C:\Users\74727\Desktop\project\VLA_franka
 
@@ -100,9 +100,11 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py
 
 ---
 
-## 键盘操作规范与流程
+## 5. 键盘操作规范与流程
 
 所有键盘操作均在 **Franka 的终端 2** 进行：
+
+### 5.1 按键功能速查表
 
 | 按键 / 操作 | 功能说明 |
 |---|---|
@@ -114,7 +116,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py
 | **`p`** | 打印当前网络连接与录制状态 |
 | **`q`** | 退出录制程序 |
 
-### 实际标准操作顺序
+### 5.2 实际标准操作顺序
 1. 启动 ROS (终端 1)
 2. 启动 Franka 笛卡尔阻抗控制器 (终端 1)
 3. 启动 `TouchFrankaTeleopController` (终端 2)
