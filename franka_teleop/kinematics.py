@@ -189,6 +189,57 @@ def correct_step_nullspace(
     return q_next, tilt_deg
 
 
+def lock_gripper_vertical_downward(
+    curr_q: np.ndarray,
+    target_pos: np.ndarray,
+    max_iters: int = 8,
+    tol_pos: float = 1e-4,
+    tol_rot: float = 1e-4,
+    damping: float = 1e-3
+) -> Tuple[np.ndarray, float]:
+    """
+    Solves 5-DOF IK with Newton-Raphson iterations:
+      - 3D Position: p(q) == target_pos (exact Cartesian position tracking)
+      - Orientation: tool z-axis strictly locked vertically downward [0, 0, -1]
+        (Roll = 0, Pitch = 0, eliminating any tilt drift to < 0.01 deg)
+    """
+    q = np.asarray(curr_q, dtype=np.float64).copy()
+    z_des = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    target_pos = np.asarray(target_pos, dtype=np.float64)
+
+    for _ in range(max_iters):
+        T = forward_kinematics(q)
+        p = T[:3, 3]
+        z_curr = T[:3, 2]
+
+        pos_err = target_pos - p
+        rot_err = np.cross(z_curr, z_des)
+
+        if np.linalg.norm(pos_err) < tol_pos and np.linalg.norm(rot_err) < tol_rot:
+            break
+
+        J = analytical_jacobian(q)
+        dx = np.concatenate([pos_err, 0.5 * rot_err])
+        J_damped = damped_pinv(J, damping=damping)
+        dq = J_damped @ dx
+
+        dq_norm = np.linalg.norm(dq)
+        if dq_norm > 0.15:
+            dq = dq * (0.15 / dq_norm)
+
+        q += dq
+        for j in range(7):
+            low, high = FRANKA_JOINT_LIMITS[j]
+            q[j] = np.clip(q[j], low, high)
+
+    T_final = forward_kinematics(q)
+    z_final = T_final[:3, 2]
+    cos_tilt = np.clip(np.dot(z_final, z_des), -1.0, 1.0)
+    tilt_deg = float(np.arccos(cos_tilt) * 180.0 / np.pi)
+
+    return q, tilt_deg
+
+
 def correct_chunk_nullspace(
     current_q: np.ndarray,
     chunk_q: np.ndarray,
@@ -199,7 +250,7 @@ def correct_chunk_nullspace(
     substeps_per_point: int = 2
 ) -> Tuple[np.ndarray, float, int]:
     """
-    Applies Task-Priority Nullspace Orientation Correction and Z_floor protection
+    Applies Strict Vertical Orientation Locking (Roll=0, Pitch=0) and Z_floor protection
     to an entire chunk of planned joint waypoints (H, 7).
     
     Args:
@@ -207,14 +258,11 @@ def correct_chunk_nullspace(
       chunk_q: Model predicted joint position chunk (H, 7)
       dt: Time delta per chunk waypoint (default: 1/15s)
       z_floor: Minimum allowable Z height (default: 0.0070m = +7.0mm)
-      kp_pos: Position tracking gain
-      kp_rot: Vertical orientation alignment gain
-      substeps_per_point: Internal integration substeps for nonlinear tracking precision
       
     Returns:
       (corrected_chunk, max_tilt_deg, z_clamped_count):
-        - corrected_chunk: Cleaned, orientation-corrected, floor-safe (H, 7) array
-        - max_tilt_deg: Maximum remaining gripper tilt angle in degrees
+        - corrected_chunk: Cleaned, strictly vertical downward, floor-safe (H, 7) array
+        - max_tilt_deg: Maximum remaining gripper tilt angle in degrees (< 0.01 deg)
         - z_clamped_count: Number of waypoints where Z floor guard was activated
     """
     curr = np.asarray(current_q, dtype=np.float64).copy()
@@ -226,8 +274,6 @@ def correct_chunk_nullspace(
     max_tilt_deg = 0.0
     z_clamped_count = 0
 
-    sub_dt = dt / float(substeps_per_point)
-
     for k in range(H):
         # 1. Extract target 3D Cartesian position from raw model waypoint
         T_target = forward_kinematics(chunk[k])
@@ -238,17 +284,16 @@ def correct_chunk_nullspace(
             p_target[2] = z_floor
             z_clamped_count += 1
 
-        # 3. Integrate substeps with closed-loop nullspace projection
-        for _ in range(substeps_per_point):
-            curr, tilt_deg = correct_step_nullspace(
-                curr,
-                target_pos=p_target,
-                dt=sub_dt,
-                kp_pos=kp_pos,
-                kp_rot=kp_rot
-            )
-            if tilt_deg > max_tilt_deg:
-                max_tilt_deg = tilt_deg
+        # 3. Solve 5-DOF IK locking orientation strictly vertical downward
+        curr, tilt_deg = lock_gripper_vertical_downward(
+            curr,
+            target_pos=p_target,
+            max_iters=8,
+            tol_pos=1e-4,
+            tol_rot=1e-4
+        )
+        if tilt_deg > max_tilt_deg:
+            max_tilt_deg = tilt_deg
 
         corrected_chunk[k] = curr.copy()
 

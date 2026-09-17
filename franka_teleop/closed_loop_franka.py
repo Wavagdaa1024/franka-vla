@@ -85,8 +85,8 @@ except ImportError:
 
 DEFAULT_PORT = 8765
 DEFAULT_SYNC_STEPS = 15       # 15 steps @ 15Hz = 1.000s motion per sync cycle
-DEFAULT_STEPS_PER_CHUNK = 15  # 15 steps total per chunk
-PREEMPT_STEP = 6              # Step at which to trigger async prefetch (400ms into chunk)
+DEFAULT_STEPS_PER_CHUNK = 8   # Rolling stride: 8 steps @ 15Hz = 533ms per chunk
+PREEMPT_STEP = 1              # Step at which to trigger async prefetch (67ms into chunk)
 DEFAULT_BLEND_STEPS = 3       # Steps over which to blend overlapping chunks
 CONTROL_HZ = 15.0             # 15 Hz policy frequency
 DT = 1.0 / CONTROL_HZ         # 0.0667 s
@@ -247,95 +247,82 @@ def run_rtc_loop(arm, conn, args):
                 rate.sleep()
                 continue
 
-            # 1. Trigger asynchronous prefetch at preempt_step
-            if step_in_chunk == args.preempt_step and not prefetch_sent:
+            # 1. Trigger asynchronous prefetch early in chunk execution
+            if step_in_chunk >= args.preempt_step and not prefetch_sent:
                 state_msg = {
                     "loop": chunk_idx + 1,
                     "q": curr_q.tolist(),
                     "pos": curr_pos.tolist(),
                     "gripper": read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0))
                 }
-                client.request_chunk(state_msg)
-                prefetch_sent = True
+                if client.request_chunk(state_msg):
+                    prefetch_sent = True
 
             # 2. Check if newly prefetched chunk has arrived
             fresh_chunk = client.get_chunk(block=False)
             if fresh_chunk is not None:
                 next_chunk = fresh_chunk
-                blending = True
-                blend_step = 0
                 lat = next_chunk.get("latency_ms", 0)
                 tilt_max = next_chunk.get("max_tilt_deg", 0.0)
                 z_clamped = next_chunk.get("z_clamped_count", 0)
                 clamp_info = f" | [CLAMP x{z_clamped}]" if z_clamped > 0 else ""
-                print(f"[RTC Chunk #{chunk_idx + 1:03d} Arrived @ Step {step_in_chunk:02d}] Lat: {lat:3.0f}ms | Tilt: {tilt_max:.1f}° | Blending {args.blend_steps} steps{clamp_info}")
+                print(f"[RTC Chunk #{chunk_idx + 1:03d} Ready] Lat: {lat:3.0f}ms | Tilt: {tilt_max:.2f}°{clamp_info}")
 
-            # 3. Compute target commands with Receding Horizon Blending
-            if blending and next_chunk is not None:
-                # Receding horizon linear cross-fade
-                w = float(blend_step + 1) / float(args.blend_steps)
-                next_pos = next_chunk.get("joint_positions", [])
-                next_vel = next_chunk.get("joint_velocities", [])
-                next_grip = next_chunk.get("gripper", [])
+            # 3. Continuous Handover when stride is reached and next chunk is ready
+            if step_in_chunk >= args.steps_per_chunk and next_chunk is not None:
+                active_chunk = next_chunk
+                pos_targets = active_chunk.get("joint_positions", [])
+                vel_targets = active_chunk.get("joint_velocities", [])
+                grip_targets = active_chunk.get("gripper", [])
+                step_in_chunk = 0
+                prefetch_sent = False
+                next_chunk = None
+                chunk_idx += 1
+                p_now, _ = arm.get_cartesian_pose()
+                print(f"[Continuous Handover #{chunk_idx:03d}] EE: [{p_now[0]:.3f}, {p_now[1]:.3f}, {p_now[2]:.3f}] | Continuous Stream")
 
-                # Index in next chunk corresponding to elapsed steps since prefetch
-                next_idx = min(max(step_in_chunk - args.preempt_step, 0), len(next_pos) - 1)
-                curr_idx = min(step_in_chunk, len(pos_targets) - 1)
-
-                if use_pos and len(pos_targets) > 0 and len(next_pos) > 0:
-                    q_des = (1.0 - w) * np.array(pos_targets[curr_idx]) + w * np.array(next_pos[next_idx])
-                    pos_err = q_des - curr_q
-                    dq_target = args.kp_pos * pos_err
-                else:
-                    dq_target = (1.0 - w) * np.array(vel_targets[curr_idx]) + w * np.array(next_vel[next_idx])
-
-                g_curr = float(grip_targets[curr_idx]) if curr_idx < len(grip_targets) else 0.0
-                g_next = float(next_grip[next_idx]) if next_idx < len(next_grip) else 0.0
-                grip_cmd = (1.0 - w) * g_curr + w * g_next
-
-                blend_step += 1
-                if blend_step >= args.blend_steps:
-                    # Handover complete! Next chunk becomes active chunk
-                    active_chunk = next_chunk
+            # 4. Target extraction & Starvation Fallback
+            total_steps = len(pos_targets) if use_pos else len(vel_targets)
+            if step_in_chunk >= total_steps:
+                # Starvation fallback: wait briefly for fresh chunk
+                print(f"  [RTC #{chunk_idx:03d}] Buffer Starvation! Waiting for next chunk...")
+                fresh = client.get_chunk(block=True, timeout=0.5)
+                if fresh is not None:
+                    active_chunk = fresh
                     pos_targets = active_chunk.get("joint_positions", [])
                     vel_targets = active_chunk.get("joint_velocities", [])
                     grip_targets = active_chunk.get("gripper", [])
-                    step_in_chunk = next_idx + 1
-                    blending = False
+                    step_in_chunk = 0
                     prefetch_sent = False
-                    next_chunk = None
                     chunk_idx += 1
-            else:
-                # Standard playback within active chunk
-                total_steps = len(pos_targets) if use_pos else len(vel_targets)
-                if step_in_chunk >= total_steps:
-                    # Starvation fallback: wait briefly or decelerate
-                    print(f"  [RTC #{chunk_idx:03d}] Buffer Starvation! Waiting for next chunk...")
-                    fresh = client.get_chunk(block=True, timeout=0.6)
-                    if fresh is not None:
-                        active_chunk = fresh
-                        pos_targets = active_chunk.get("joint_positions", [])
-                        vel_targets = active_chunk.get("joint_velocities", [])
-                        grip_targets = active_chunk.get("gripper", [])
-                        step_in_chunk = 0
-                        prefetch_sent = False
-                        chunk_idx += 1
-                        continue
-                    else:
-                        arm.stop()
-                        prev_dq = np.zeros(7)
-                        rate.sleep()
-                        continue
-
-                if use_pos:
-                    q_des = np.array(pos_targets[step_in_chunk], dtype=np.float64)
-                    pos_err = q_des - curr_q
-                    dq_target = args.kp_pos * pos_err
+                    continue
                 else:
-                    dq_target = np.array(vel_targets[step_in_chunk], dtype=np.float64)
+                    if not prefetch_sent:
+                        client.request_chunk(state_msg)
+                        prefetch_sent = True
+                    arm.stop()
+                    prev_dq = np.zeros(7)
+                    rate.sleep()
+                    continue
 
-                grip_cmd = float(grip_targets[step_in_chunk]) if step_in_chunk < len(grip_targets) else 0.0
-                step_in_chunk += 1
+            if use_pos:
+                q_des = np.array(pos_targets[step_in_chunk], dtype=np.float64)
+                pos_err = q_des - curr_q
+                dq_target = args.kp_pos * pos_err
+
+                # Real-time closed-loop vertical orientation locking
+                z_live = forward_kinematics(curr_q)[:3, 2]
+                w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
+                if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
+                    J = analytical_jacobian(curr_q)
+                    J_w = J[3:, :]
+                    J_w_pinv = J_w.T @ np.linalg.inv(J_w @ J_w.T + 1e-4 * np.eye(3))
+                    dq_target += J_w_pinv @ (3.0 * w_tilt)
+            else:
+                dq_target = np.array(vel_targets[step_in_chunk], dtype=np.float64)
+
+            grip_cmd = float(grip_targets[step_in_chunk]) if step_in_chunk < len(grip_targets) else 0.0
+            step_in_chunk += 1
 
             # 4. Joint Speed & Acceleration Limiting
             dq_target = np.clip(dq_target, -args.max_vel, args.max_vel)
