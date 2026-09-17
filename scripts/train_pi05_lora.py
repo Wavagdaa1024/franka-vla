@@ -61,6 +61,7 @@ from franka_teleop.pi05_engine.lora import (
 )
 from franka_teleop.pi05_engine.utils import prepare_attention_masks_4d
 from franka_teleop.tensor_utils import make_att_2d_masks
+from franka_teleop.kinematics import FrankaDifferentiableKinematics
 
 # Default Paths
 REPO_ROOT = PROJECT_ROOT
@@ -229,7 +230,7 @@ def build_multitask_dataset(dataset_dirs, task_filter=None):
     return all_samples, cached_files, task_buckets
 
 
-def evaluate_sample(inference, s, cached_files):
+def evaluate_sample(inference, s, cached_files, dfk=None):
     """Run full 10-step Euler integration inference on a single sample and return physical action metrics."""
     cf = cached_files[s["file_id"]]
     f_idx = s["frame_idx"]
@@ -261,6 +262,18 @@ def evaluate_sample(inference, s, cached_files):
     hold_still_mae_deg = float(np.degrees(hold_still_mae_rad))
     improve_pct = float((hold_still_mae_rad - joint_mae_rad) / max(hold_still_mae_rad, 1e-6) * 100.0)
 
+    ee_pos_err_mm = None
+    ee_tilt_deg = None
+    if dfk is not None:
+        pred_q_traj = torch.from_numpy(curr_q[None, :] + pred_chunk[:, :7]).float()
+        gt_q_traj = torch.from_numpy(curr_q[None, :] + gt_delta_q).float()
+        with torch.no_grad():
+            p_pred, z_pred = dfk(pred_q_traj.to("cuda:0" if torch.cuda.is_available() else "cpu"))
+            p_gt, _ = dfk(gt_q_traj.to("cuda:0" if torch.cuda.is_available() else "cpu"))
+            ee_pos_err_mm = float(torch.norm(p_pred - p_gt, dim=-1).mean().item() * 1000.0)
+            z_u = z_pred / torch.norm(z_pred, dim=-1, keepdim=True).clamp(min=1e-6)
+            ee_tilt_deg = float(torch.rad2deg(torch.acos(torch.clamp(-z_u[..., 2], -1.0, 1.0))).mean().item())
+
     return {
         "task": s["task"],
         "action_mse": action_mse,
@@ -269,6 +282,8 @@ def evaluate_sample(inference, s, cached_files):
         "joint_mae_deg": joint_mae_deg,
         "hold_still_mae_deg": hold_still_mae_deg,
         "improve_pct": improve_pct,
+        "ee_pos_err_mm": ee_pos_err_mm,
+        "ee_tilt_deg": ee_tilt_deg,
         "pred_chunk": pred_chunk,
         "gt_chunk": gt_action_chunk,
         "frame_idx": f_idx,
@@ -291,6 +306,8 @@ def main():
     parser.add_argument("--save-freq", type=int, default=DEFAULT_SAVE_FREQ)
     parser.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ)
     parser.add_argument("--task-filter", type=str, default=None, help="Filter dataset by task substring (e.g. 'red cube')")
+    parser.add_argument("--cartesian-loss-weight", type=float, default=5.0, help="Weight for EE 3D position MSE loss (default: 5.0)")
+    parser.add_argument("--vertical-loss-weight", type=float, default=2.0, help="Weight for EE vertical downward orientation loss (default: 2.0)")
     parser.add_argument("--preflight-only", action="store_true", help="Run empirical benchmark and exit")
     args = parser.parse_args()
 
@@ -306,6 +323,7 @@ def main():
     print(f"[*] Learning Rate:   {args.lr:.2e}")
     print(f"[*] PaliGemma LoRA:  Rank={args.lang_rank}, Alpha={args.lang_rank*2} (Attention projections)")
     print(f"[*] Action Expert:   Rank={args.expert_rank}, Alpha={args.expert_rank*2} (Attention projections)")
+    print(f"[*] DFK Aux Losses:  Cartesian Pos Weight={args.cartesian_loss_weight}, Vertical Z Downward Weight={args.vertical_loss_weight}")
     print(f"[*] Action Space:    15-step cumulative relative joint displacement a[k] = q[t+k+1] - q[t]")
     print(f"[*] State Noise:     {args.state_noise:.4f} rad (Anti-Trajectory Memorization)")
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
@@ -377,6 +395,11 @@ def main():
         torch.tensor(getattr(net.config, "time_sampling_beta_alpha", 1.5), device="cuda:0"),
         torch.tensor(getattr(net.config, "time_sampling_beta_beta", 1.0), device="cuda:0")
     )
+
+    dfk = None
+    if args.cartesian_loss_weight > 0 or args.vertical_loss_weight > 0:
+        print("\n[Kinematics] Initializing PyTorch Franka Differentiable Kinematics (DFK) on cuda:0...")
+        dfk = FrankaDifferentiableKinematics(device="cuda:0")
 
     def sample_balanced_batch(batch_size):
         """Samples a balanced mixture across all tasks."""
@@ -496,8 +519,38 @@ def main():
             timestep=time_steps.to(dtype=proj_dtype),
         )
 
-        loss = F.mse_loss(v_pred[:, :, :8], v_target[:, :, :8])
-        return loss
+        flow_loss = F.mse_loss(v_pred[:, :, :8], v_target[:, :, :8])
+
+        cartesian_loss = torch.tensor(0.0, device="cuda:0")
+        vertical_loss = torch.tensor(0.0, device="cuda:0")
+        pos_err_mm = 0.0
+        tilt_err_deg = 0.0
+
+        if dfk is not None and (args.cartesian_loss_weight > 0 or args.vertical_loss_weight > 0):
+            pred_norm_actions_8d = (noise[:, :, :8] - v_pred[:, :, :8]).float()
+            pred_actions_8d = processor._transform(pred_norm_actions_8d, "action", "ACTION", inverse=True)
+            pred_delta_q = pred_actions_8d[:, :, :7]
+
+            curr_q_tensor = torch.as_tensor(state_t[:, :7], device="cuda:0", dtype=torch.float32).unsqueeze(1)
+            pred_q_traj = curr_q_tensor + pred_delta_q
+            pred_p_ee, pred_z_ee = dfk(pred_q_traj)
+
+            if args.cartesian_loss_weight > 0:
+                with torch.no_grad():
+                    gt_q_traj = curr_q_tensor + actions_gpu[:, :, :7]
+                    gt_p_ee, _ = dfk(gt_q_traj)
+                cartesian_loss = F.mse_loss(pred_p_ee, gt_p_ee)
+                pos_err_mm = float(torch.norm(pred_p_ee - gt_p_ee, dim=-1).mean().item() * 1000.0)
+
+            if args.vertical_loss_weight > 0:
+                target_z = torch.tensor([0.0, 0.0, -1.0], device="cuda:0", dtype=torch.float32).expand_as(pred_z_ee)
+                vertical_loss = F.mse_loss(pred_z_ee, target_z)
+                with torch.no_grad():
+                    z_u = pred_z_ee / torch.norm(pred_z_ee, dim=-1, keepdim=True).clamp(min=1e-6)
+                    tilt_err_deg = float(torch.rad2deg(torch.acos(torch.clamp(-z_u[..., 2], -1.0, 1.0))).mean().item())
+
+        total_loss = flow_loss + args.cartesian_loss_weight * cartesian_loss + args.vertical_loss_weight * vertical_loss
+        return total_loss, flow_loss, cartesian_loss, vertical_loss, pos_err_mm, tilt_err_deg
 
     # PREFLIGHT MODE
     if args.preflight_only:
@@ -510,7 +563,7 @@ def main():
         # Warmup step
         optimizer.zero_grad()
         f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-        w_loss = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+        w_loss, _, _, _, _, _ = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
         w_loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -520,14 +573,26 @@ def main():
         t_bench_start = time.perf_counter()
         for i in range(trial_steps):
             optimizer.zero_grad()
+            step_loss_val = 0.0
+            step_flow_val = 0.0
+            step_pos_val = 0.0
+            step_vert_val = 0.0
+            step_pos_err_val = 0.0
+            step_tilt_err_val = 0.0
             for _ in range(args.grad_accum):
                 f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-                loss_step = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
-                (loss_step / args.grad_accum).backward()
+                tot_l, f_l, p_l, v_l, p_err, t_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+                (tot_l / args.grad_accum).backward()
+                step_loss_val += tot_l.item() / args.grad_accum
+                step_flow_val += f_l.item() / args.grad_accum
+                step_pos_val += p_l.item() / args.grad_accum
+                step_vert_val += v_l.item() / args.grad_accum
+                step_pos_err_val += p_err / args.grad_accum
+                step_tilt_err_val += t_err / args.grad_accum
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             torch.cuda.synchronize()
-            print(f"    Trial step {i+1}/{trial_steps}: Flow Loss = {loss_step.item():.5f}")
+            print(f"    Trial step {i+1}/{trial_steps}: Total Loss={step_loss_val:.4f} (Flow={step_flow_val:.4f}, PosLoss={step_pos_val:.5f}, VertLoss={step_vert_val:.4f}) | PosErr={step_pos_err_val:.1f}mm | TiltErr={step_tilt_err_val:.1f}°")
         t_bench_end = time.perf_counter()
 
         elapsed_bench = t_bench_end - t_bench_start
@@ -548,51 +613,80 @@ def main():
         return 0
 
     # Initial Baseline Eval on all tasks
-    print("\n[Initial Baseline Eval @ Step 0 across all 5 Tasks]")
+    print(f"\n[Initial Baseline Eval @ Step 0 across all {len(eval_samples)} Tasks]")
     net.eval()
     for t_name, s_eval in eval_samples.items():
-        res = evaluate_sample(inference, s_eval, cached_files)
-        print(f"  Task '{t_name:30s}': MSE={res['action_mse']:.6f} | Joint MAE={res['joint_mae_deg']:.2f}° (Hold: {res['hold_still_mae_deg']:.2f}°) | Grip={res['pred_chunk'][:, 7].mean():.2f}")
+        res = evaluate_sample(inference, s_eval, cached_files, dfk=dfk)
+        tilt_str = f" | Tilt={res['ee_tilt_deg']:.1f}°" if res.get('ee_tilt_deg') is not None else ""
+        pos_str = f" | EE PosErr={res['ee_pos_err_mm']:.1f}mm" if res.get('ee_pos_err_mm') is not None else ""
+        print(f"  Task '{t_name:30s}': MSE={res['action_mse']:.6f} | Joint MAE={res['joint_mae_deg']:.2f}° (Hold: {res['hold_still_mae_deg']:.2f}°){pos_str}{tilt_str} | Grip={res['pred_chunk'][:, 7].mean():.2f}")
     net.train()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n[Training Started] Running {args.steps} steps with effective batch_size={args.batch_size * args.grad_accum}...")
 
     losses = []
+    flow_losses = []
+    cart_losses = []
+    vert_losses = []
+    pos_errors = []
+    tilt_errors = []
     t_start = time.perf_counter()
 
     for step in range(1, args.steps + 1):
         optimizer.zero_grad()
         accum_loss = 0.0
+        accum_flow = 0.0
+        accum_cart = 0.0
+        accum_vert = 0.0
+        accum_pos_err = 0.0
+        accum_tilt_err = 0.0
 
         for _ in range(args.grad_accum):
             f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-            loss = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
-            (loss / args.grad_accum).backward()
-            accum_loss += loss.item() / args.grad_accum
+            tot_l, f_l, p_l, v_l, p_err, t_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+            (tot_l / args.grad_accum).backward()
+            accum_loss += tot_l.item() / args.grad_accum
+            accum_flow += f_l.item() / args.grad_accum
+            accum_cart += p_l.item() / args.grad_accum
+            accum_vert += v_l.item() / args.grad_accum
+            accum_pos_err += p_err / args.grad_accum
+            accum_tilt_err += t_err / args.grad_accum
 
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
         losses.append(accum_loss)
+        flow_losses.append(accum_flow)
+        cart_losses.append(accum_cart)
+        vert_losses.append(accum_vert)
+        pos_errors.append(accum_pos_err)
+        tilt_errors.append(accum_tilt_err)
 
         if step % args.log_freq == 0:
             avg_loss = np.mean(losses[-args.log_freq:])
+            avg_flow = np.mean(flow_losses[-args.log_freq:])
+            avg_cart = np.mean(cart_losses[-args.log_freq:])
+            avg_vert = np.mean(vert_losses[-args.log_freq:])
+            avg_pos_err = np.mean(pos_errors[-args.log_freq:])
+            avg_tilt_err = np.mean(tilt_errors[-args.log_freq:])
             cur_lr = scheduler.get_last_lr()[0]
             elapsed = time.perf_counter() - t_start
             steps_per_sec = step / elapsed
-            print(f"  [Step {step:04d}/{args.steps:04d}] Flow Loss: {avg_loss:.5f} | LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} step/s | Elapsed: {elapsed/60:.1f}m")
+            print(f"  [Step {step:04d}/{args.steps:04d}] Loss: {avg_loss:.4f} (Flow: {avg_flow:.4f}, PosLoss: {avg_cart:.5f}, VertLoss: {avg_vert:.4f}) | PosErr: {avg_pos_err:.1f}mm | TiltErr: {avg_tilt_err:.1f}° | LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} s/s | Elapsed: {elapsed/60:.1f}m")
 
         if step % args.eval_freq == 0:
             net.eval()
             print(f"\n  >>> [EVALUATION @ Step {step:04d}] <<<")
             eval_maes = []
             for t_name, s_eval in eval_samples.items():
-                res = evaluate_sample(inference, s_eval, cached_files)
+                res = evaluate_sample(inference, s_eval, cached_files, dfk=dfk)
                 eval_maes.append(res['joint_mae_deg'])
-                print(f"      '{t_name:30s}': MSE={res['action_mse']:.6f} | MAE={res['joint_mae_deg']:.2f}° vs Hold={res['hold_still_mae_deg']:.2f}° ({res['improve_pct']:+.1f}%) | Grip={res['pred_chunk'][:, 7].mean():.2f}")
-            print(f"      [Mean Joint MAE across all 5 tasks: {np.mean(eval_maes):.2f}°]\n")
+                tilt_str = f" | Tilt={res['ee_tilt_deg']:.1f}°" if res.get('ee_tilt_deg') is not None else ""
+                pos_str = f" | EE PosErr={res['ee_pos_err_mm']:.1f}mm" if res.get('ee_pos_err_mm') is not None else ""
+                print(f"      '{t_name:30s}': MSE={res['action_mse']:.6f} | MAE={res['joint_mae_deg']:.2f}° (Hold={res['hold_still_mae_deg']:.2f}°){pos_str}{tilt_str} | Grip={res['pred_chunk'][:, 7].mean():.2f}")
+            print(f"      [Mean Joint MAE across all {len(eval_samples)} tasks: {np.mean(eval_maes):.2f}°]\n")
             net.train()
 
         if step % args.save_freq == 0 or step == args.steps:
@@ -601,6 +695,11 @@ def main():
             torch.save({
                 "step": step,
                 "loss": float(np.mean(losses[-50:])),
+                "flow_loss": float(np.mean(flow_losses[-50:])),
+                "cartesian_loss": float(np.mean(cart_losses[-50:])),
+                "vertical_loss": float(np.mean(vert_losses[-50:])),
+                "pos_err_mm": float(np.mean(pos_errors[-50:])),
+                "tilt_err_deg": float(np.mean(tilt_errors[-50:])),
                 "state_dict": state_dict,
                 "lang_rank": args.lang_rank,
                 "expert_rank": args.expert_rank,

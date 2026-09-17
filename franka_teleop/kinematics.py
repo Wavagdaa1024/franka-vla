@@ -357,3 +357,77 @@ def project_velocity_z_floor(
             return dq_filtered, True
 
     return dq, False
+
+
+# ==============================================================================
+# PyTorch Vectorized Differentiable Kinematics Module
+# ==============================================================================
+try:
+    import torch
+    import torch.nn as nn
+
+    class FrankaDifferentiableKinematics(nn.Module):
+        """
+        Vectorized, fully differentiable Forward Kinematics module for Franka Emika Panda.
+        Computes analytical end-effector position and tool Z-axis orientation
+        from joint positions q via Craig's Modified DH convention with autograd support.
+        """
+        def __init__(self, device: str = "cpu"):
+            super().__init__()
+            self.mdh_params = MDH_PARAMS
+            a8, d8, alpha8 = MDH_PARAMS[7]
+            ca8, sa8 = float(np.cos(alpha8)), float(np.sin(alpha8))
+            A8 = np.array([
+                [1.0, 0.0, 0.0, a8],
+                [0.0, ca8, -sa8, -sa8 * d8],
+                [0.0, sa8, ca8, ca8 * d8],
+                [0.0, 0.0, 0.0, 1.0]
+            ], dtype=np.float32)
+            flange_tool = A8 @ DEFAULT_F_T_EE.astype(np.float32)
+            self.register_buffer("flange_tool", torch.from_numpy(flange_tool).to(device=device))
+
+        def forward(self, q: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+            """
+            Args:
+                q: Joint angles tensor of shape (..., 7) in radians.
+            Returns:
+                p_ee: Cartesian 3D position of shape (..., 3) in meters.
+                z_ee: Tool Z-axis orientation unit vector of shape (..., 3).
+                      (Downwards tool orientation target: [0, 0, -1]).
+            """
+            orig_shape = q.shape[:-1]
+            q_flat = q.reshape(-1, 7)
+            N = q_flat.shape[0]
+            device = q.device
+            dtype = q.dtype
+
+            T = torch.eye(4, dtype=dtype, device=device).unsqueeze(0).repeat(N, 1, 1)
+            zeros = torch.zeros(N, dtype=dtype, device=device)
+            ones = torch.ones(N, dtype=dtype, device=device)
+
+            for i in range(7):
+                a, d, alpha = self.mdh_params[i]
+                ca = float(np.cos(alpha))
+                sa = float(np.sin(alpha))
+                theta = q_flat[:, i]
+                c = torch.cos(theta)
+                s = torch.sin(theta)
+
+                row0 = torch.stack([c, -s, zeros, torch.full_like(theta, a)], dim=-1)
+                row1 = torch.stack([s * ca, c * ca, torch.full_like(theta, -sa), torch.full_like(theta, -sa * d)], dim=-1)
+                row2 = torch.stack([s * sa, c * sa, torch.full_like(theta, ca), torch.full_like(theta, ca * d)], dim=-1)
+                row3 = torch.stack([zeros, zeros, zeros, ones], dim=-1)
+                A_i = torch.stack([row0, row1, row2, row3], dim=-2)
+                T = torch.bmm(T, A_i)
+
+            flange_tool_expanded = self.flange_tool.to(dtype=dtype, device=device).unsqueeze(0).expand(N, 4, 4)
+            T = torch.bmm(T, flange_tool_expanded)
+            p_ee = T[:, :3, 3].reshape(*orig_shape, 3)
+            z_ee = T[:, :3, 2].reshape(*orig_shape, 3)
+            return p_ee, z_ee
+
+except ImportError:
+    class FrankaDifferentiableKinematics:  # type: ignore
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("PyTorch is required to use FrankaDifferentiableKinematics.")
+
