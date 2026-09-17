@@ -88,9 +88,6 @@ def test_cameras(args):
         print("  Tips: Check USB cables, ensure no other python/agent process is holding the camera open.")
         return 1
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
     try:
         print("\n[*] Capturing frames and measuring integrity...")
         t0 = time.time()
@@ -114,8 +111,10 @@ def test_cameras(args):
         print(f"[*] Capture Completed: {success_count}/{args.num_frames} frames captured ({success_count/args.num_frames*100:.1f}%)")
         print(f"[*] Measured Rate:     {fps_measured:.2f} FPS")
 
-        # Save snapshots
-        if last_f is not None and last_w is not None:
+        # Save snapshots only if explicitly requested with --save
+        if args.save and last_f is not None and last_w is not None:
+            out_dir = Path(args.output_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
             front_path = out_dir / "front_camera.jpg"
             wrist_path = out_dir / "wrist_camera.jpg"
             combined_path = out_dir / "dual_cameras_preview.jpg"
@@ -123,8 +122,6 @@ def test_cameras(args):
             Image.fromarray(last_f).save(front_path, quality=95)
             Image.fromarray(last_w).save(wrist_path, quality=95)
 
-            # Combine side by side
-            h = min(last_f.shape[0], last_w.shape[0])
             combined = np.hstack([last_f, last_w])
             Image.fromarray(combined).save(combined_path, quality=95)
 
@@ -180,6 +177,7 @@ def main():
     parser.add_argument("--fps", type=int, default=30, help="Frame rate (default: 30)")
     parser.add_argument("--num-frames", type=int, default=15, help="Number of frames to test (default: 15)")
     parser.add_argument("--output-dir", default="outputs/camera_preview", help="Directory to save snapshot preview images")
+    parser.add_argument("--save", action="store_true", help="Save snapshot images to outputs/camera_preview (default: disabled)")
     parser.add_argument("--gui", "--view", dest="gui", action="store_true", help="Launch live OpenCV interactive preview window")
     args = parser.parse_args()
 
