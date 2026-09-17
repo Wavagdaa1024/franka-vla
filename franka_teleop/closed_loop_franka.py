@@ -2,16 +2,20 @@
 # -*- coding: utf-8 -*-
 """
 Live Franka Closed-Loop Execution Service.
-Runs on Franka Linux Control PC (10.197.16.43:8765).
+Runs on Franka Linux Control PC (10.197.16.43:8765) or simulation.
 
-Modes Supported:
-  1. Synchronous Stop-and-Go (--sync, default):
-     Arm stops -> Settles 50ms (zero motion blur) -> Samples exact state -> 
-     Requests chunk from GPU Agent -> Executes N steps -> Arm stops smoothly -> Repeats.
-     Completely eliminates camera motion blur and 300ms observation latency.
+Execution Modes:
+  1. RTC Continuous Streaming (--rtc, default):
+     Arm NEVER stops: Receding Horizon Blending smoothly fuses overlapping action
+     chunks across a 3-step transition window (Zero Stutter / Fluid Motion).
+  2. Synchronous Stop-and-Go (--sync):
+     Arm stops -> Settles stationary -> Informs GPU Agent -> Executes N steps -> Halts.
 
-  2. Asynchronous Continuous Double-Buffer (--async-mode):
-     Arm never stops: background worker prefetches chunk K+1 at step 5 of 10.
+Safety Systems:
+  - Task-Priority Nullspace Orientation Stabilization
+  - Hard Table Collision Guard: Z >= z_min (default: +0.0070m = +7.0mm, calibrated at physical table lowest point)
+  - Acceleration & Speed Clamps with Anti-Jerk Smoothing
+  - Asynchronous Non-Blocking Gripper Actuation
 """
 
 import os
@@ -27,7 +31,6 @@ if os.path.exists(ROS_NOETIC_PYTHON) and ROS_NOETIC_PYTHON not in sys.path:
 
 import time
 import json
-import math
 import socket
 import struct
 import argparse
@@ -36,71 +39,59 @@ import queue
 import numpy as np
 
 import rospy
-from std_msgs.msg import Float64MultiArray
 
-# Import the 1kHz joint velocity controller client
-from Base_franka_joint_velocity_controller import FrankaJointVelocityController
+# Import kinematics module (supports both local Linux directory and Windows package)
+try:
+    from kinematics import (
+        forward_kinematics,
+        analytical_jacobian,
+        project_velocity_z_floor,
+        DEFAULT_Z_FLOOR,
+        FRANKA_JOINT_LIMITS
+    )
+except ImportError:
+    from franka_teleop.kinematics import (
+        forward_kinematics,
+        analytical_jacobian,
+        project_velocity_z_floor,
+        DEFAULT_Z_FLOOR,
+        FRANKA_JOINT_LIMITS
+    )
+
+# Import 1kHz joint velocity controller client
+try:
+    from Base_franka_joint_velocity_controller import FrankaJointVelocityController
+except ImportError:
+    # Fallback mock for testing in non-ROS environments
+    class FrankaJointVelocityController:
+        def __init__(self):
+            self._q = np.array([0.1329, 0.4759, 0.0550, -2.4485, 0.0220, 2.8999, 0.9361], dtype=np.float64)
+            self._grip = 0.04
+        def get_cartesian_pose(self):
+            T = forward_kinematics(self._q)
+            return T[:3, 3], np.array([0, 0, 0, 1])
+        def get_joint_positions(self):
+            return self._q.copy()
+        def get_gripper_width(self):
+            return self._grip
+        def set_joint_velocities(self, dq):
+            self._q += np.asarray(dq) * (1.0 / 15.0)
+        def stop(self):
+            pass
+        def close_gripper(self, **kwargs):
+            self._grip = 0.01
+        def open_gripper(self, **kwargs):
+            self._grip = 0.08
 
 DEFAULT_PORT = 8765
-DEFAULT_SYNC_STEPS = 10      # 10 steps @ 30Hz = 0.333s motion per sync cycle
-DEFAULT_STEPS_PER_CHUNK = 12 # 12 steps @ 30Hz = 0.400s per chunk in async mode
-PREEMPT_STEP = 6             # Step at which to trigger async prefetch
-CONTROL_HZ = 30.0            # 30 Hz policy frequency (aligned with 30Hz teleop dataset)
-DT = 1.0 / CONTROL_HZ        # 0.0333 s
-MAX_JOINT_VEL = 0.35         # 0.35 rad/s max safe testing speed
-MAX_JOINT_ACC = 2.5          # 2.5 rad/s^2 smooth responsive acceleration clamp
-Z_MIN = 0.055                # Safe floor: 5.5 cm above Franka base (Anti-collision)
-Z_MAX = 0.65
-
-# Franka Panda soft joint limits (with 0.05 rad buffer)
-JOINT_LIMITS = [
-    (-2.84, 2.84),
-    (-1.71, 1.71),
-    (-2.84, 2.84),
-    (-3.02, -0.12),
-    (-2.84, 2.84),
-    (0.03, 3.70),
-    (-2.84, 2.84)
-]
-
-
-# Franka Craig-modified DH Forward Kinematics for Z-Height Safety Guard
-def rot_x(alpha):
-    c, s = np.cos(alpha), np.sin(alpha)
-    return np.array([[1, 0, 0, 0], [0, c, -s, 0], [0, s, c, 0], [0, 0, 0, 1]])
-
-def trans_x(a):
-    T = np.eye(4)
-    T[0, 3] = a
-    return T
-
-def rot_z(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, -s, 0, 0], [s, c, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-
-def trans_z(d):
-    T = np.eye(4)
-    T[2, 3] = d
-    return T
-
-def franka_fk(q, ee_offset=0.107):
-    mdh = [
-        (0, 0.333, 0),
-        (0, 0, -np.pi/2),
-        (0, 0.316, np.pi/2),
-        (0.0825, 0, np.pi/2),
-        (-0.0825, 0.384, -np.pi/2),
-        (0, 0, np.pi/2),
-        (0.088, 0, np.pi/2),
-        (0, ee_offset, 0)
-    ]
-    T = np.eye(4)
-    for i in range(7):
-        a, d, alpha = mdh[i]
-        theta = q[i]
-        T = T @ (rot_x(alpha) @ trans_x(a) @ rot_z(theta) @ trans_z(d))
-    T = T @ (rot_x(mdh[7][2]) @ trans_x(mdh[7][0]) @ trans_z(mdh[7][1]))
-    return T
+DEFAULT_SYNC_STEPS = 15       # 15 steps @ 15Hz = 1.000s motion per sync cycle
+DEFAULT_STEPS_PER_CHUNK = 15  # 15 steps total per chunk
+PREEMPT_STEP = 6              # Step at which to trigger async prefetch (400ms into chunk)
+DEFAULT_BLEND_STEPS = 3       # Steps over which to blend overlapping chunks
+CONTROL_HZ = 15.0             # 15 Hz policy frequency
+DT = 1.0 / CONTROL_HZ         # 0.0667 s
+MAX_JOINT_VEL = 0.35          # 0.35 rad/s max safe testing speed
+MAX_JOINT_ACC = 1.5           # 1.5 rad/s^2 smooth responsive acceleration clamp
 
 
 def send_json(conn, obj):
@@ -130,11 +121,11 @@ def recv_json(conn):
 
 
 class AsyncChunkClient:
-    """Asynchronous background worker for continuous double-buffer streaming."""
+    """Asynchronous background worker for continuous streaming & prefetching."""
     def __init__(self, conn):
         self.conn = conn
         self.req_queue = queue.Queue(maxsize=1)
-        self.resp_queue = queue.Queue(maxsize=1)
+        self.resp_queue = queue.Queue(maxsize=2)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self._worker, daemon=True)
         self.thread.start()
@@ -155,10 +146,13 @@ class AsyncChunkClient:
             resp["latency_ms"] = (time.time() - t0) * 1000.0
 
             try:
-                self.resp_queue.get_nowait()
-            except queue.Empty:
-                pass
-            self.resp_queue.put(resp)
+                self.resp_queue.put_nowait(resp)
+            except queue.Full:
+                try:
+                    self.resp_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self.resp_queue.put(resp)
 
     def request_chunk(self, state_msg):
         try:
@@ -179,213 +173,44 @@ class AsyncChunkClient:
 
 
 def read_gripper_normalized(arm, default=0.0):
-    """
-    DROID / OpenPI standard:
-      0.0 = OPEN (width > 0.035m)
-      1.0 = CLOSED
-    """
+    """0.0 = OPEN (width=0.08m), 1.0 = CLOSED (width=0.0m)."""
     w = arm.get_gripper_width()
     if w is None:
         return default
-    return 0.0 if w > 0.035 else 1.0
+    return float(np.clip(1.0 - float(w) / 0.08, 0.0, 1.0))
 
 
-def run_sync_loop(arm, conn, args):
+def run_rtc_loop(arm, conn, args):
     """
-    Synchronous Stop-and-Go Closed-Loop Control Loop:
-      1. Settle stationary (50ms) -> No motion blur
-      2. Sample exact stationary joint state and gripper width
-      3. Request chunk from Windows GPU Agent and block-wait for inference
-      4. Execute N steps with safety guards
-      5. Repeat smoothly
-    """
-    rate = rospy.Rate(CONTROL_HZ)
-    init_grip = read_gripper_normalized(arm, default=0.0)
-    gripper_state = 0 if init_grip <= 0.5 else 1  # 0=OPEN, 1=CLOSED
-    chunk_idx = 0
-    t_start = time.time()
-    prev_dq = np.zeros(7, dtype=np.float64)
-    close_intent_counter = 0
-
-    print("=" * 75)
-    print("  SYNCHRONOUS STOP-AND-GO MODE ACTIVE")
-    print(f"  [Config] Sync Steps:       {args.sync_steps} steps (~{args.sync_steps * DT:.2f}s motion per cycle)")
-    print(f"  [Config] Settling Time:    {args.settle_time * 1000:.0f} ms (Zero Motion Blur)")
-    print(f"  [Config] Speed Clamp:      {args.max_vel:.2f} rad/s")
-    print(f"  [Config] Table Floor:      Z >= {args.z_min * 100:.1f} cm")
-    print(f"  [Config] Initial Gripper:  {'OPEN' if gripper_state == 1 else 'CLOSED'} (width={init_grip:.2f})")
-    print("=" * 75)
-
-    try:
-        while not rospy.is_shutdown():
-            chunk_idx += 1
-
-            # Step 1: Ensure arm is completely halted & settle stationary
-            arm.stop()
-            prev_dq = np.zeros(7, dtype=np.float64)
-            if args.settle_time > 0:
-                rospy.sleep(args.settle_time)
-
-            # Step 2: Read exact stationary hardware state
-            curr_pos, _ = arm.get_cartesian_pose()
-            curr_q = arm.get_joint_positions()
-            if curr_pos is None or curr_q is None:
-                rospy.sleep(0.02)
-                continue
-
-            curr_grip = read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0))
-
-            state_msg = {
-                "loop": chunk_idx,
-                "q": curr_q.tolist(),
-                "pos": curr_pos.tolist(),
-                "gripper": curr_grip
-            }
-
-            # Step 3: Synchronously request action chunk from Windows GPU Agent
-            t_infer_start = time.time()
-            if not send_json(conn, state_msg):
-                print("[ERROR] Failed to send state message to GPU Agent! Exiting.")
-                break
-
-            resp = recv_json(conn)
-            if resp is None:
-                print("[ERROR] Connection closed or invalid response from GPU Agent! Exiting.")
-                break
-
-            infer_ms = (time.time() - t_infer_start) * 1000.0
-            pos_targets = resp.get("joint_positions", [])
-            vels = resp.get("joint_velocities", [])
-            grips = resp.get("gripper", [])
-            action_mode = resp.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
-            use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
-
-            if not use_pos and (not vels or len(vels) == 0):
-                print(f"  [Sync #{chunk_idx:03d}] Warning: empty chunk received. Holding position.")
-                continue
-
-            # Step 4: Execute up to args.sync_steps steps smoothly
-            total_steps_in_chunk = len(pos_targets) if use_pos else len(vels)
-            steps_to_exec = min(args.sync_steps, total_steps_in_chunk)
-            p_ee, _ = arm.get_cartesian_pose()
-            mode_tag = "POS-SERVO" if use_pos else "VEL-OPEN"
-            print(f"[Sync Cycle #{chunk_idx:03d} | {mode_tag}] Infer: {infer_ms:4.0f}ms | EE: [{p_ee[0]:+.3f}, {p_ee[1]:+.3f}, {p_ee[2]:+.3f}] | Grip: {grips[0]:.2f} | Exec: {steps_to_exec} steps")
-
-            interrupted = False
-            for step in range(steps_to_exec):
-                if rospy.is_shutdown():
-                    break
-
-                curr_q_live = arm.get_joint_positions()
-                if use_pos and curr_q_live is not None:
-                    q_des = np.array(pos_targets[step], dtype=np.float64)
-                    pos_err = q_des - curr_q_live
-                    dq_target = args.kp_pos * pos_err
-                else:
-                    dq_target = np.array(vels[step], dtype=np.float64)
-
-                grip_cmd = float(grips[step]) if step < len(grips) else 0.0
-
-                # 1. Clamp target speed
-                dq_target = np.clip(dq_target, -args.max_vel, args.max_vel)
-                if args.flip_lr:
-                    dq_target[0] = -dq_target[0]
-
-                # 2. Acceleration smoothing
-                max_delta = MAX_JOINT_ACC * DT
-                dq_smooth = np.clip(dq_target, prev_dq - max_delta, prev_dq + max_delta)
-
-                # 3. Soft joint limit safety guard
-                if curr_q_live is not None:
-                    q_pred = curr_q_live + dq_smooth * DT
-                    for i in range(7):
-                        if q_pred[i] < JOINT_LIMITS[i][0] and dq_smooth[i] < 0:
-                            dq_smooth[i] = 0.0
-                        elif q_pred[i] > JOINT_LIMITS[i][1] and dq_smooth[i] > 0:
-                            dq_smooth[i] = 0.0
-
-                    # 4. Z_MIN Table Anti-Collision Safety Guard
-                    ee_pred = franka_fk(curr_q_live + dq_smooth * DT)[:3, 3]
-                    if ee_pred[2] < args.z_min:
-                        dq_smooth = np.zeros(7, dtype=np.float64)
-                        print(f"  [FLOOR GUARD] Z limit reached ({ee_pred[2]:.3f}m < {args.z_min:.2f}m). Clamped velocity to 0.")
-
-                # Publish velocity to controller
-                if not args.shadow:
-                    arm.set_joint_velocities(dq_smooth)
-                else:
-                    if step == 0:
-                        print(f"  [SHADOW DRY-RUN] dq: {[round(x, 3) for x in dq_smooth]}")
-                prev_dq = dq_smooth.copy()
-
-                # Gripper control logic (DROID standard: 0.0 = OPEN, 1.0 = CLOSED)
-                # Non-blocking trigger: NEVER stop arm or break chunk execution!
-                if grip_cmd > 0.65:
-                    # Model wants to CLOSE gripper
-                    close_intent_counter += 1
-                    if gripper_state == 0 and close_intent_counter >= args.close_delay_steps:
-                        def _do_close():
-                            try:
-                                arm.close_gripper(width=0.04, force=15.0, speed=0.1, inner_epsilon=0.025, outer_epsilon=0.025)
-                            except Exception as e:
-                                rospy.logwarn(f"Gripper close: {e}")
-                        threading.Thread(target=_do_close, daemon=True).start()
-                        gripper_state = 1
-                        print(f"  [GRIPPER] Closed in background (cmd={grip_cmd:.2f})")
-                elif grip_cmd < 0.35:
-                    # Model wants to OPEN gripper
-                    close_intent_counter = 0
-                    if gripper_state == 1:
-                        def _do_open():
-                            try:
-                                arm.open_gripper(width=0.08, speed=0.1)
-                            except Exception as e:
-                                rospy.logwarn(f"Gripper open: {e}")
-                        threading.Thread(target=_do_open, daemon=True).start()
-                        gripper_state = 0
-                        print(f"  [GRIPPER] Opened in background (cmd={grip_cmd:.2f})")
-
-                rate.sleep()
-
-            # Step 5: Stop arm at the end of the executed chunk steps
-            arm.stop()
-            prev_dq = np.zeros(7, dtype=np.float64)
-
-    except KeyboardInterrupt:
-        print("\n[PAUSE] Synchronous loop stopped by user.")
-    except Exception as e:
-        print(f"\n[WARN] Synchronous loop exception: {e}")
-
-    return chunk_idx, t_start
-
-
-def run_async_loop(arm, conn, args):
-    """
-    Asynchronous Continuous Double-Buffering Loop (Arm Never Stops).
-    Prefetches chunk K+1 at PREEMPT_STEP while executing chunk K.
+    Real-Time Chunking (RTC) Continuous Streaming Loop:
+      - Prefetches Chunk K+1 at args.preempt_step (step 6).
+      - Receding Horizon Blending over args.blend_steps (3 steps) upon chunk arrival.
+      - Arm moves fluidly with 0ms stop pause.
+      - Dual-layer table collision guard (Z >= args.z_min).
     """
     client = AsyncChunkClient(conn)
     rate = rospy.Rate(CONTROL_HZ)
-    init_grip = read_gripper_normalized(arm, default=1.0)
-    gripper_state = 1 if init_grip > 0.5 else 0
+    init_grip = read_gripper_normalized(arm, default=0.0)
+    gripper_state = 0 if init_grip <= 0.5 else 1
     chunk_idx = 0
     t_start = time.time()
     prev_dq = np.zeros(7, dtype=np.float64)
     close_intent_counter = 0
 
-    print("=" * 75)
-    print("  ASYNCHRONOUS CONTINUOUS STREAMING MODE ACTIVE (DOUBLE BUFFER)")
-    print(f"  [Config] Handover Steps:   {args.steps_per_chunk} steps (~{args.steps_per_chunk * DT:.2f}s per chunk)")
-    print(f"  [Config] Prefetch Step:    {args.preempt_step}")
-    print(f"  [Config] Speed Clamp:      {args.max_vel:.2f} rad/s")
-    print(f"  [Config] Table Floor:      Z >= {args.z_min * 100:.1f} cm")
-    print("=" * 75)
+    print("=" * 80)
+    print("  REAL-TIME CHUNKING (RTC) CONTINUOUS STREAMING ACTIVE")
+    print(f"  [Config] Control Frequency: {CONTROL_HZ} Hz (DT = {DT * 1000:.1f} ms)")
+    print(f"  [Config] Prefetch Timing:   Step {args.preempt_step} ({args.preempt_step * DT * 1000:.0f} ms)")
+    print(f"  [Config] Receding Window:   {args.blend_steps} steps ({args.blend_steps * DT * 1000:.0f} ms blend)")
+    print(f"  [Config] Hard Floor Guard:  Z >= {args.z_min * 1000.0:.1f} mm")
+    print(f"  [Config] Max Speed Clamp:   {args.max_vel:.2f} rad/s")
+    print("=" * 80)
 
+    # Fetch initial Chunk 0 synchronously to bootstrap motion
     start_pos, _ = arm.get_cartesian_pose()
     start_q = arm.get_joint_positions()
+    print(f"\n[Bootstrap] Arm Pose: [{start_pos[0]:+.3f}, {start_pos[1]:+.3f}, {start_pos[2]:+.3f}] m. Fetching Chunk 0...")
 
-    # Fetch initial chunk
-    print(f"\n[Bootstrap] Gripper state: {'OPEN' if gripper_state == 1 else 'CLOSED'} (width={init_grip:.2f}). Fetching initial chunk...")
     init_state = {
         "loop": 0,
         "q": start_q.tolist(),
@@ -393,44 +218,36 @@ def run_async_loop(arm, conn, args):
         "gripper": init_grip
     }
     client.request_chunk(init_state)
-    active_chunk = client.get_chunk(block=True, timeout=10.0)
+    active_chunk = client.get_chunk(block=True, timeout=15.0)
 
     if active_chunk is None:
-        print("[ERROR] Failed to receive initial action chunk from Windows GPU Agent!")
+        print("[ERROR] Failed to receive bootstrap action chunk from GPU Agent!")
         client.stop()
         return 0, t_start
 
-    active_vels = active_chunk.get("joint_velocities", [])
-    active_grips = active_chunk.get("gripper", [])
-    print(f"[Bootstrap OK] Received initial chunk ({len(active_vels)} steps, infer: {active_chunk.get('latency_ms', 0):.0f}ms). Starting streaming...")
+    pos_targets = active_chunk.get("joint_positions", [])
+    vel_targets = active_chunk.get("joint_velocities", [])
+    grip_targets = active_chunk.get("gripper", [])
+    action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
+    use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
+
+    print(f"[Bootstrap OK] Received Chunk 0 ({len(pos_targets) if use_pos else len(vel_targets)} steps, Infer: {active_chunk.get('latency_ms', 0):.0f}ms). Starting continuous RTC...")
 
     step_in_chunk = 0
     prefetch_sent = False
+    blending = False
+    blend_step = 0
+    next_chunk = None
 
     try:
         while not rospy.is_shutdown():
-            if step_in_chunk >= len(active_vels):
-                print(f"  [Buffer Starvation] Waiting for fresh chunk...")
-                fresh = client.get_chunk(block=True, timeout=0.8)
-                if fresh is not None:
-                    active_chunk = fresh
-                    active_vels = active_chunk.get("joint_velocities", [])
-                    active_grips = active_chunk.get("gripper", [])
-                    step_in_chunk = 0
-                    prefetch_sent = False
-                    chunk_idx += 1
-                else:
-                    arm.stop()
-                    prev_dq = np.zeros(7)
-                    rate.sleep()
-                    continue
-
             curr_pos, _ = arm.get_cartesian_pose()
             curr_q = arm.get_joint_positions()
             if curr_pos is None or curr_q is None:
                 rate.sleep()
                 continue
 
+            # 1. Trigger asynchronous prefetch at preempt_step
             if step_in_chunk == args.preempt_step and not prefetch_sent:
                 state_msg = {
                     "loop": chunk_idx + 1,
@@ -441,22 +258,86 @@ def run_async_loop(arm, conn, args):
                 client.request_chunk(state_msg)
                 prefetch_sent = True
 
-            if step_in_chunk >= args.steps_per_chunk:
-                next_chunk = client.get_chunk(block=False)
-                if next_chunk is not None:
-                    chunk_idx += 1
+            # 2. Check if newly prefetched chunk has arrived
+            fresh_chunk = client.get_chunk(block=False)
+            if fresh_chunk is not None:
+                next_chunk = fresh_chunk
+                blending = True
+                blend_step = 0
+                lat = next_chunk.get("latency_ms", 0)
+                tilt_max = next_chunk.get("max_tilt_deg", 0.0)
+                z_clamped = next_chunk.get("z_clamped_count", 0)
+                clamp_info = f" | [CLAMP x{z_clamped}]" if z_clamped > 0 else ""
+                print(f"[RTC Chunk #{chunk_idx + 1:03d} Arrived @ Step {step_in_chunk:02d}] Lat: {lat:3.0f}ms | Tilt: {tilt_max:.1f}° | Blending {args.blend_steps} steps{clamp_info}")
+
+            # 3. Compute target commands with Receding Horizon Blending
+            if blending and next_chunk is not None:
+                # Receding horizon linear cross-fade
+                w = float(blend_step + 1) / float(args.blend_steps)
+                next_pos = next_chunk.get("joint_positions", [])
+                next_vel = next_chunk.get("joint_velocities", [])
+                next_grip = next_chunk.get("gripper", [])
+
+                # Index in next chunk corresponding to elapsed steps since prefetch
+                next_idx = min(max(step_in_chunk - args.preempt_step, 0), len(next_pos) - 1)
+                curr_idx = min(step_in_chunk, len(pos_targets) - 1)
+
+                if use_pos and len(pos_targets) > 0 and len(next_pos) > 0:
+                    q_des = (1.0 - w) * np.array(pos_targets[curr_idx]) + w * np.array(next_pos[next_idx])
+                    pos_err = q_des - curr_q
+                    dq_target = args.kp_pos * pos_err
+                else:
+                    dq_target = (1.0 - w) * np.array(vel_targets[curr_idx]) + w * np.array(next_vel[next_idx])
+
+                g_curr = float(grip_targets[curr_idx]) if curr_idx < len(grip_targets) else 0.0
+                g_next = float(next_grip[next_idx]) if next_idx < len(next_grip) else 0.0
+                grip_cmd = (1.0 - w) * g_curr + w * g_next
+
+                blend_step += 1
+                if blend_step >= args.blend_steps:
+                    # Handover complete! Next chunk becomes active chunk
                     active_chunk = next_chunk
-                    active_vels = active_chunk.get("joint_velocities", [])
-                    active_grips = active_chunk.get("gripper", [])
-                    lat = active_chunk.get("latency_ms", 0)
-                    step_in_chunk = 0
+                    pos_targets = active_chunk.get("joint_positions", [])
+                    vel_targets = active_chunk.get("joint_velocities", [])
+                    grip_targets = active_chunk.get("gripper", [])
+                    step_in_chunk = next_idx + 1
+                    blending = False
                     prefetch_sent = False
-                    p_now, _ = arm.get_cartesian_pose()
-                    print(f"[Chunk #{chunk_idx:03d} Handover] Infer: {lat:3.0f}ms | EE: [{p_now[0]:.3f}, {p_now[1]:.3f}, {p_now[2]:.3f}] | Continuous Stream")
+                    next_chunk = None
+                    chunk_idx += 1
+            else:
+                # Standard playback within active chunk
+                total_steps = len(pos_targets) if use_pos else len(vel_targets)
+                if step_in_chunk >= total_steps:
+                    # Starvation fallback: wait briefly or decelerate
+                    print(f"  [RTC #{chunk_idx:03d}] Buffer Starvation! Waiting for next chunk...")
+                    fresh = client.get_chunk(block=True, timeout=0.6)
+                    if fresh is not None:
+                        active_chunk = fresh
+                        pos_targets = active_chunk.get("joint_positions", [])
+                        vel_targets = active_chunk.get("joint_velocities", [])
+                        grip_targets = active_chunk.get("gripper", [])
+                        step_in_chunk = 0
+                        prefetch_sent = False
+                        chunk_idx += 1
+                        continue
+                    else:
+                        arm.stop()
+                        prev_dq = np.zeros(7)
+                        rate.sleep()
+                        continue
 
-            dq_target = np.array(active_vels[step_in_chunk], dtype=np.float64)
-            grip_cmd = float(active_grips[step_in_chunk]) if step_in_chunk < len(active_grips) else 0.0
+                if use_pos:
+                    q_des = np.array(pos_targets[step_in_chunk], dtype=np.float64)
+                    pos_err = q_des - curr_q
+                    dq_target = args.kp_pos * pos_err
+                else:
+                    dq_target = np.array(vel_targets[step_in_chunk], dtype=np.float64)
 
+                grip_cmd = float(grip_targets[step_in_chunk]) if step_in_chunk < len(grip_targets) else 0.0
+                step_in_chunk += 1
+
+            # 4. Joint Speed & Acceleration Limiting
             dq_target = np.clip(dq_target, -args.max_vel, args.max_vel)
             if args.flip_lr:
                 dq_target[0] = -dq_target[0]
@@ -464,153 +345,285 @@ def run_async_loop(arm, conn, args):
             max_delta = MAX_JOINT_ACC * DT
             dq_smooth = np.clip(dq_target, prev_dq - max_delta, prev_dq + max_delta)
 
-            curr_q_live = arm.get_joint_positions()
-            if curr_q_live is not None:
-                q_pred = curr_q_live + dq_smooth * DT
-                for i in range(7):
-                    if q_pred[i] < JOINT_LIMITS[i][0] and dq_smooth[i] < 0:
-                        dq_smooth[i] = 0.0
-                    elif q_pred[i] > JOINT_LIMITS[i][1] and dq_smooth[i] > 0:
-                        dq_smooth[i] = 0.0
+            # 5. Joint Soft Limits Protection
+            q_pred = curr_q + dq_smooth * DT
+            for i in range(7):
+                if q_pred[i] < FRANKA_JOINT_LIMITS[i][0] and dq_smooth[i] < 0:
+                    dq_smooth[i] = 0.0
+                elif q_pred[i] > FRANKA_JOINT_LIMITS[i][1] and dq_smooth[i] > 0:
+                    dq_smooth[i] = 0.0
 
-                ee_pred = franka_fk(curr_q_live + dq_smooth * DT)[:3, 3]
-                if ee_pred[2] < args.z_min:
-                    dq_smooth = np.zeros(7, dtype=np.float64)
-                    print(f"  [FLOOR GUARD] Z limit reached ({ee_pred[2]:.3f}m < {args.z_min:.2f}m). Clamped velocity to 0.")
+            # 6. Real-Time Table Floor Collision Guard (Z >= z_min)
+            dq_safe, clamped = project_velocity_z_floor(curr_q, dq_smooth, dt=DT, z_floor=args.z_min)
+            if clamped:
+                p_now = forward_kinematics(curr_q)[:3, 3]
+                print(f"  [FLOOR GUARD] Z limit enforced: EE Z={p_now[2] * 1000.0:.1f}mm >= {args.z_min * 1000.0:.1f}mm")
 
-            arm.set_joint_velocities(dq_smooth)
-            prev_dq = dq_smooth.copy()
+            # 7. Publish velocity to 1kHz controller
+            if not args.shadow:
+                arm.set_joint_velocities(dq_safe)
+            prev_dq = dq_safe.copy()
 
-            # Gripper control logic (DROID standard: 0.0 = OPEN, 1.0 = CLOSED)
-            # Non-blocking trigger: NEVER stop arm or break chunk execution!
+            # 8. Asynchronous Gripper Actuation
             if grip_cmd > 0.65:
-                # Model wants to CLOSE gripper (grasp)
                 close_intent_counter += 1
                 if gripper_state == 0 and close_intent_counter >= args.close_delay_steps:
-                    def _do_close_async():
+                    def _do_close():
                         try:
-                            arm.close_gripper(width=0.04, force=15.0, speed=0.1, inner_epsilon=0.025, outer_epsilon=0.025)
+                            arm.close_gripper(width=0.04, force=15.0, speed=0.35, inner_epsilon=0.025, outer_epsilon=0.025)
                         except Exception as e:
                             rospy.logwarn(f"Gripper close: {e}")
-                    threading.Thread(target=_do_close_async, daemon=True).start()
+                    threading.Thread(target=_do_close, daemon=True).start()
                     gripper_state = 1
-                    print(f"  [GRIPPER] Closed in background (cmd={grip_cmd:.2f})")
+                    print(f"  [GRIPPER] Closing triggered in background (cmd={grip_cmd:.2f})")
             elif grip_cmd < 0.35:
-                # Model wants to OPEN gripper (release)
                 close_intent_counter = 0
                 if gripper_state == 1:
-                    def _do_open_async():
+                    def _do_open():
                         try:
-                            arm.open_gripper(width=0.08, speed=0.1)
+                            arm.open_gripper(width=0.08, speed=0.35)
                         except Exception as e:
                             rospy.logwarn(f"Gripper open: {e}")
-                    threading.Thread(target=_do_open_async, daemon=True).start()
+                    threading.Thread(target=_do_open, daemon=True).start()
                     gripper_state = 0
-                    print(f"  [GRIPPER] Opened in background (cmd={grip_cmd:.2f})")
+                    print(f"  [GRIPPER] Opening triggered in background (cmd={grip_cmd:.2f})")
 
-            step_in_chunk += 1
             rate.sleep()
 
     except KeyboardInterrupt:
-        print("\n[PAUSE] Asynchronous loop stopped by user.")
+        print("\n[PAUSE] RTC continuous loop stopped by user.")
     except Exception as e:
-        print(f"\n[WARN] Asynchronous loop exception: {e}")
+        print(f"\n[WARN] RTC loop exception: {e}")
     finally:
         client.stop()
 
     return chunk_idx, t_start
 
 
+def run_sync_loop(arm, conn, args):
+    """Synchronous Stop-and-Go Closed-Loop Control Loop (Fallback)."""
+    rate = rospy.Rate(CONTROL_HZ)
+    init_grip = read_gripper_normalized(arm, default=0.0)
+    gripper_state = 0 if init_grip <= 0.5 else 1
+    chunk_idx = 0
+    t_start = time.time()
+    prev_dq = np.zeros(7, dtype=np.float64)
+    close_intent_counter = 0
+
+    print("=" * 80)
+    print("  SYNCHRONOUS STOP-AND-GO MODE ACTIVE")
+    print(f"  [Config] Steps per Cycle:  {args.sync_steps} steps (~{args.sync_steps * DT:.2f}s motion)")
+    print(f"  [Config] Settling Time:    {args.settle_time * 1000:.0f} ms (Zero Motion Blur)")
+    print(f"  [Config] Table Floor:      Z >= {args.z_min * 1000.0:.1f} mm")
+    print("=" * 80)
+
+    try:
+        while not rospy.is_shutdown():
+            chunk_idx += 1
+            arm.stop()
+            prev_dq = np.zeros(7, dtype=np.float64)
+            if args.settle_time > 0:
+                rospy.sleep(args.settle_time)
+
+            curr_pos, _ = arm.get_cartesian_pose()
+            curr_q = arm.get_joint_positions()
+            if curr_pos is None or curr_q is None:
+                rospy.sleep(0.02)
+                continue
+
+            curr_grip = read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0))
+            state_msg = {
+                "loop": chunk_idx,
+                "q": curr_q.tolist(),
+                "pos": curr_pos.tolist(),
+                "gripper": curr_grip
+            }
+
+            t_infer_start = time.time()
+            if not send_json(conn, state_msg):
+                print("[ERROR] Failed to send state message! Exiting.")
+                break
+
+            resp = recv_json(conn)
+            if resp is None:
+                print("[ERROR] Connection closed! Exiting.")
+                break
+
+            infer_ms = (time.time() - t_infer_start) * 1000.0
+            pos_targets = resp.get("joint_positions", [])
+            vels = resp.get("joint_velocities", [])
+            grips = resp.get("gripper", [])
+            action_mode = resp.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
+            use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
+
+            total_steps = len(pos_targets) if use_pos else len(vels)
+            steps_to_exec = min(args.sync_steps, total_steps)
+            p_ee = forward_kinematics(curr_q)[:3, 3]
+            tilt_max = resp.get("max_tilt_deg", 0.0)
+            z_clamped = resp.get("z_clamped_count", 0)
+            clamp_info = f" | [CLAMP x{z_clamped}]" if z_clamped > 0 else ""
+            print(f"[Sync Cycle #{chunk_idx:03d}] Infer: {infer_ms:4.0f}ms | EE: [{p_ee[0]:+.3f}, {p_ee[1]:+.3f}, {p_ee[2]:+.3f}] | Tilt: {tilt_max:.1f}° | Grip: {grips[0]:.2f}{clamp_info}")
+
+            for step in range(steps_to_exec):
+                if rospy.is_shutdown():
+                    break
+
+                curr_q_live = arm.get_joint_positions()
+                if curr_q_live is None:
+                    continue
+
+                if use_pos:
+                    q_des = np.array(pos_targets[step], dtype=np.float64)
+                    pos_err = q_des - curr_q_live
+                    dq_target = args.kp_pos * pos_err
+                else:
+                    dq_target = np.array(vels[step], dtype=np.float64)
+
+                grip_cmd = float(grips[step]) if step < len(grips) else 0.0
+
+                dq_target = np.clip(dq_target, -args.max_vel, args.max_vel)
+                if args.flip_lr:
+                    dq_target[0] = -dq_target[0]
+
+                max_delta = MAX_JOINT_ACC * DT
+                dq_smooth = np.clip(dq_target, prev_dq - max_delta, prev_dq + max_delta)
+
+                # Floor collision check
+                dq_safe, clamped = project_velocity_z_floor(curr_q_live, dq_smooth, dt=DT, z_floor=args.z_min)
+
+                # Soft deceleration near cycle end
+                rem = steps_to_exec - 1 - step
+                if rem == 1:
+                    dq_safe *= 0.5
+                elif rem == 0:
+                    dq_safe *= 0.2
+
+                if not args.shadow:
+                    arm.set_joint_velocities(dq_safe)
+                prev_dq = dq_safe.copy()
+
+                # Gripper
+                if grip_cmd > 0.65:
+                    close_intent_counter += 1
+                    if gripper_state == 0 and close_intent_counter >= args.close_delay_steps:
+                        def _do_close():
+                            try:
+                                arm.close_gripper(width=0.04, force=15.0, speed=0.35, inner_epsilon=0.025, outer_epsilon=0.025)
+                            except Exception as e:
+                                rospy.logwarn(f"Gripper close: {e}")
+                        threading.Thread(target=_do_close, daemon=True).start()
+                        gripper_state = 1
+                elif grip_cmd < 0.35:
+                    close_intent_counter = 0
+                    if gripper_state == 1:
+                        def _do_open():
+                            try:
+                                arm.open_gripper(width=0.08, speed=0.35)
+                            except Exception as e:
+                                rospy.logwarn(f"Gripper open: {e}")
+                        threading.Thread(target=_do_open, daemon=True).start()
+                        gripper_state = 0
+
+                rate.sleep()
+
+            arm.stop()
+            prev_dq = np.zeros(7, dtype=np.float64)
+
+    except KeyboardInterrupt:
+        print("\n[PAUSE] Sync loop stopped by user.")
+    except Exception as e:
+        print(f"\n[WARN] Sync loop exception: {e}")
+
+    return chunk_idx, t_start
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Franka Closed-Loop Joint Velocity Execution Service")
+    parser = argparse.ArgumentParser(description="Franka Closed-Loop VLA Execution Service")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Listening port (default: 8765)")
-    parser.add_argument("--sync", dest="sync", action="store_true", default=True, help="Enable synchronous Stop-and-Go mode (default: True)")
-    parser.add_argument("--async-mode", dest="sync", action="store_false", help="Enable asynchronous continuous double-buffer mode")
-    parser.add_argument("--sync-steps", type=int, default=DEFAULT_SYNC_STEPS, help="Chunk steps to run per cycle in sync mode (default: 10 @ 30Hz = 0.33s)")
-    parser.add_argument("--settle-time", type=float, default=0.05, help="Stationary settling time in seconds before inference (default: 0.05s = 50ms)")
-    parser.add_argument("--steps-per-chunk", type=int, default=DEFAULT_STEPS_PER_CHUNK, help="Steps before handover in async mode (default: 12)")
-    parser.add_argument("--preempt-step", type=int, default=PREEMPT_STEP, help="Step to prefetch in async mode (default: 6)")
-    parser.add_argument("--max-vel", type=float, default=MAX_JOINT_VEL, help="Max joint speed clamp in rad/s (default: 0.35)")
-    parser.add_argument("--max-acc", type=float, default=MAX_JOINT_ACC, help="Max joint acceleration clamp in rad/s^2 (default: 2.5)")
-    parser.add_argument("--z-min", type=float, default=Z_MIN, help="Minimum safe Z height in meters (default: 0.055)")
-    parser.add_argument("--flip-lr", action="store_true", default=False, help="Invert Joint 1 (base yaw, default: False)")
-    parser.add_argument("--close-delay-steps", type=int, default=2, help="Debounce steps before closing gripper (default: 2 steps = ~0.067s @ 30Hz)")
-    parser.add_argument("--kp-pos", type=float, default=8.0, help="P-servo tracking gain for joint position mode in rad/s per rad error (default: 8.0)")
-    parser.add_argument("--shadow", action="store_true", default=False, help="Shadow mode: log tracking commands without publishing physical robot velocities")
+    parser.add_argument("--rtc", dest="rtc", action="store_true", default=True,
+                        help="Enable Real-Time Chunking continuous streaming mode (default: True)")
+    parser.add_argument("--sync", dest="rtc", action="store_false",
+                        help="Enable synchronous Stop-and-Go mode (fallback)")
+    parser.add_argument("--sync-steps", type=int, default=DEFAULT_SYNC_STEPS,
+                        help="Steps per cycle in sync mode (default: 15)")
+    parser.add_argument("--settle-time", type=float, default=0.05,
+                        help="Stationary settling time before inference in sync mode (default: 0.05s)")
+    parser.add_argument("--preempt-step", type=int, default=PREEMPT_STEP,
+                        help="Step to trigger async prefetch in RTC mode (default: 6)")
+    parser.add_argument("--blend-steps", type=int, default=DEFAULT_BLEND_STEPS,
+                        help="Steps over which to blend overlapping chunks in RTC mode (default: 3)")
+    parser.add_argument("--max-vel", type=float, default=MAX_JOINT_VEL,
+                        help="Max joint speed clamp in rad/s (default: 0.35)")
+    parser.add_argument("--max-acc", type=float, default=MAX_JOINT_ACC,
+                        help="Max joint acceleration clamp in rad/s^2 (default: 1.5)")
+    parser.add_argument("--z-min", type=float, default=DEFAULT_Z_FLOOR,
+                        help=f"Minimum safe table Z height in meters (default: {DEFAULT_Z_FLOOR}m = +7.0mm)")
+    parser.add_argument("--kp-pos", type=float, default=8.0,
+                        help="P-servo tracking gain for joint position mode (default: 8.0)")
+    parser.add_argument("--close-delay-steps", type=int, default=2,
+                        help="Debounce steps before closing gripper (default: 2)")
+    parser.add_argument("--flip-lr", action="store_true", default=False,
+                        help="Invert Joint 0 (base yaw)")
+    parser.add_argument("--shadow", action="store_true", default=False,
+                        help="Shadow mode: log commands without moving physical robot")
     args = parser.parse_args()
 
     if not rospy.core.is_initialized():
         rospy.init_node("closed_loop_franka_server", anonymous=True)
 
-    mode_str = "SYNCHRONOUS (Stop-and-Go)" if args.sync else "ASYNCHRONOUS (Continuous Double-Buffer)"
-    print("=" * 75)
+    mode_str = "RTC (Continuous Real-Time Chunking)" if args.rtc else "SYNCHRONOUS (Stop-and-Go)"
+    print("=" * 80)
     print(f"  FRANKA CLOSED-LOOP SERVICE: {mode_str}")
-    print("=" * 75)
-    print(f"[*] Listening Port:        {args.port}")
-    print(f"[*] Execution Mode:        {mode_str}")
-    if args.sync:
-        print(f"[*] Steps per Cycle:       {args.sync_steps} steps (~{args.sync_steps * DT:.2f}s motion)")
-        print(f"[*] Settling Pause:        {args.settle_time * 1000:.0f} ms")
+    print("=" * 80)
+    print(f"[*] Port:              {args.port}")
+    print(f"[*] Mode:              {mode_str}")
+    if args.rtc:
+        print(f"[*] RTC Handover:      Step {args.preempt_step} (Prefetch) -> Blend {args.blend_steps} steps")
     else:
-        print(f"[*] Handover Timing:       Step {args.preempt_step} (Prefetch) -> Step {args.steps_per_chunk} (Handover)")
-    print(f"[*] Max Joint Speed:       {args.max_vel:.2f} rad/s")
-    print(f"[*] Safe Table Floor:      Z >= {args.z_min * 100:.1f} cm")
-    print("-" * 75)
+        print(f"[*] Sync Steps:        {args.sync_steps} steps (Pause: {args.settle_time * 1000:.0f}ms)")
+    print(f"[*] Hard Table Floor:  Z >= {args.z_min * 1000.0:.1f} mm")
+    print(f"[*] Max Speed:         {args.max_vel:.2f} rad/s")
+    print("-" * 80)
 
-    # 1. Connect to Franka Joint Velocity Controller Client
-    print("[1/3] Connecting to Franka Joint Velocity Controller Client...")
+    print("[1/2] Connecting to Franka Controller Client...")
     arm = FrankaJointVelocityController()
 
     start_wait = time.time()
-    initial_pos, initial_quat = None, None
-    initial_q = None
+    initial_pos, initial_q = None, None
     while time.time() - start_wait < 5.0 and not rospy.is_shutdown():
-        initial_pos, initial_quat = arm.get_cartesian_pose()
+        initial_pos, _ = arm.get_cartesian_pose()
         initial_q = arm.get_joint_positions()
         if initial_pos is not None and initial_q is not None:
             break
         rospy.sleep(0.05)
 
     if initial_pos is None or initial_q is None:
-        print("[ERROR] Failed to receive Franka robot state within 5.0s!")
+        print("[ERROR] Failed to receive Franka robot state!")
         return 1
 
-    start_pos = initial_pos.copy()
-    start_q = initial_q.copy()
     print(f"[OK] Franka Connected.")
-    print(f"     Initial EE Pose: x={start_pos[0]:+.4f}, y={start_pos[1]:+.4f}, z={start_pos[2]:+.4f} m")
-    print(f"     Initial Joints:  [{', '.join(f'{v:+.3f}' for v in start_q)}]")
+    print(f"     EE Pose:   [{initial_pos[0]:+.4f}, {initial_pos[1]:+.4f}, {initial_pos[2]:+.4f}] m")
+    print(f"     Joints:    [{', '.join(f'{v:+.3f}' for v in initial_q)}]")
 
-    # 2. Setup Listening Socket
-    print(f"[2/3] Setting up TCP Server on port {args.port}...")
+    print(f"[2/2] Setting up TCP Server on port {args.port}...")
     server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_sock.bind(("0.0.0.0", args.port))
     server_sock.listen(1)
-    print(f"[OK] Server listening on port {args.port}. Waiting for Windows GPU Agent to connect...")
+    print(f"[OK] Listening on port {args.port}. Awaiting GPU Agent...")
 
     conn, addr = server_sock.accept()
-    print(f"[OK] Windows GPU Agent Connected from {addr}!")
-
-    print("-" * 75)
+    print(f"[OK] GPU Agent Connected from {addr}!")
+    print("-" * 80)
     input("[READY] Hold physical E-STOP. Press [ENTER] to start closed-loop control...")
-
-    # Refresh live hardware pose immediately upon user ENTER
-    live_pos, _ = arm.get_cartesian_pose()
-    live_q = arm.get_joint_positions()
-    if live_pos is not None and live_q is not None:
-        start_pos = live_pos.copy()
-        start_q = live_q.copy()
-        print(f"[OK] Starting Pose: x={start_pos[0]:+.4f}, y={start_pos[1]:+.4f}, z={start_pos[2]:+.4f} m")
 
     total_chunks = 0
     t_start = time.time()
-
     try:
-        if args.sync:
-            total_chunks, t_start = run_sync_loop(arm, conn, args)
+        if args.rtc:
+            total_chunks, t_start = run_rtc_loop(arm, conn, args)
         else:
-            total_chunks, t_start = run_async_loop(arm, conn, args)
+            total_chunks, t_start = run_sync_loop(arm, conn, args)
     finally:
         try:
             conn.close()
@@ -623,15 +636,14 @@ def main():
 
         arm.stop()
         p_final, _ = arm.get_cartesian_pose()
-        print("\n" + "=" * 75)
+        print("\n" + "=" * 80)
         print("  CLOSED-LOOP EXECUTION TERMINATED SAFELY")
-        print("=" * 75)
-        print(f"[*] Total Cycles/Chunks: {total_chunks}")
-        print(f"[*] Elapsed Time:        {time.time() - t_start:.1f} s")
+        print("=" * 80)
+        print(f"[*] Total Chunks: {total_chunks}")
+        print(f"[*] Elapsed:      {time.time() - t_start:.1f} s")
         if p_final is not None:
-            print(f"[*] Final Position:      x={p_final[0]:+.4f}, y={p_final[1]:+.4f}, z={p_final[2]:+.4f} m")
-        print("[*] Status:              Arm stopped safely (holding position).")
-        print("=" * 75)
+            print(f"[*] Final Pose:   [{p_final[0]:+.4f}, {p_final[1]:+.4f}, {p_final[2]:+.4f}] m")
+        print("=" * 80)
 
     return 0
 

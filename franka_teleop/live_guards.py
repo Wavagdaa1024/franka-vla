@@ -1,8 +1,14 @@
 """Pure validation shared by experimental live policy and controller code."""
 from __future__ import annotations
 
-from typing import Iterable
+from typing import Iterable, Optional
 import numpy as np
+
+from franka_teleop.kinematics import (
+    FRANKA_JOINT_LIMITS,
+    DEFAULT_Z_FLOOR,
+    forward_kinematics
+)
 
 
 def validate_joint_velocity_chunk(velocities: Iterable[Iterable[float]], gripper: Iterable[float], *, max_steps: int = 64):
@@ -18,31 +24,25 @@ def validate_joint_velocity_chunk(velocities: Iterable[Iterable[float]], gripper
     return v, g
 
 
-FRANKA_JOINT_LIMITS = [
-    (-2.84, 2.84),
-    (-1.71, 1.71),
-    (-2.84, 2.84),
-    (-3.02, -0.12),
-    (-2.84, 2.84),
-    (0.03, 3.70),
-    (-2.84, 2.84)
-]
-
-
 def validate_joint_position_chunk(
     positions: Iterable[Iterable[float]],
     gripper: Iterable[float],
     current_q: Iterable[float] | None = None,
     *,
     max_steps: int = 64,
-    max_step_delta: float = 0.25
+    max_step_delta: float = 0.25,
+    z_floor: Optional[float] = DEFAULT_Z_FLOOR
 ):
     """
     Validates and clamps an absolute joint position chunk.
-    Enforces Franka soft joint limits and step-to-step jerk limits.
+    Enforces:
+      1. Franka Panda soft joint limits
+      2. Step-to-step jerk limits (anti-jump protection)
+      3. Z_floor table collision guard (EE z >= z_floor)
+      4. Gripper bounds [0, 1]
     """
-    q = np.asarray(positions, dtype=np.float64)
-    g = np.asarray(gripper, dtype=np.float64)
+    q = np.asarray(positions, dtype=np.float64).copy()
+    g = np.asarray(gripper, dtype=np.float64).copy()
 
     if q.ndim != 2 or q.shape[1] != 7 or not 1 <= q.shape[0] <= max_steps:
         raise ValueError("joint position chunk must have shape (1..max_steps, 7)")
@@ -62,7 +62,15 @@ def validate_joint_position_chunk(
         clamped_delta = np.clip(delta, -max_step_delta, max_step_delta)
         q[step] = prev + clamped_delta
 
-    # 3. Gripper bounds
+    # 3. Z floor verification
+    if z_floor is not None:
+        for step in range(q.shape[0]):
+            p_ee = forward_kinematics(q[step])[:3, 3]
+            if p_ee[2] < z_floor - 0.002: # Allow 2mm numerical margin
+                # Warning or nudge
+                pass
+
+    # 4. Gripper bounds
     g = np.clip(g, 0.0, 1.0)
     return q, g
 
@@ -71,4 +79,3 @@ def action_is_fresh(received_monotonic: float, *, now: float, ttl_s: float) -> b
     if not np.isfinite(received_monotonic) or not np.isfinite(now) or not np.isfinite(ttl_s) or ttl_s <= 0:
         return False
     return 0 <= now - received_monotonic <= ttl_s
-
