@@ -126,6 +126,7 @@ DEFAULT_SYNC_STEPS = 15       # 15 steps @ 15Hz = 1.000s motion per sync cycle
 DEFAULT_STEPS_PER_CHUNK = 8   # Rolling stride: 8 steps @ 15Hz = 533ms per chunk
 PREEMPT_STEP = 1              # Step at which to trigger async prefetch (67ms into chunk)
 DEFAULT_BLEND_STEPS = 3       # Steps over which to blend overlapping chunks
+DEFAULT_GRIPPER_OPEN_WIDTH = 0.070  # 70mm safe opening (10mm buffer below 80mm physical stop)
 CONTROL_HZ = 15.0             # 15 Hz policy frequency
 DT = 1.0 / CONTROL_HZ         # 0.0667 s
 MAX_JOINT_VEL = 0.35          # 0.35 rad/s max safe testing speed
@@ -488,7 +489,7 @@ def run_rtc_loop(arm, conn, args):
                 if gripper_state == 1:
                     def _do_open():
                         try:
-                            arm.open_gripper(width=0.08, speed=0.35)
+                            arm.open_gripper(width=getattr(args, "gripper_open_width", DEFAULT_GRIPPER_OPEN_WIDTH), speed=0.35)
                         except Exception as e:
                             rospy.logwarn(f"Gripper open: {e}")
                     threading.Thread(target=_do_open, daemon=True).start()
@@ -661,7 +662,7 @@ def run_sync_loop(arm, conn, args):
                     if gripper_state == 1:
                         def _do_open():
                             try:
-                                arm.open_gripper(width=0.08, speed=0.35)
+                                arm.open_gripper(width=getattr(args, "gripper_open_width", DEFAULT_GRIPPER_OPEN_WIDTH), speed=0.35)
                             except Exception as e:
                                 rospy.logwarn(f"Gripper open: {e}")
                         threading.Thread(target=_do_open, daemon=True).start()
@@ -705,6 +706,8 @@ def main():
                         help=f"Minimum safe table Z height in meters (default: {DEFAULT_Z_FLOOR}m = +7.0mm)")
     parser.add_argument("--kp-pos", type=float, default=8.0,
                         help="P-servo tracking gain for joint position mode (default: 8.0)")
+    parser.add_argument("--gripper-open-width", type=float, default=DEFAULT_GRIPPER_OPEN_WIDTH,
+                        help=f"Gripper opening width in meters (default: {DEFAULT_GRIPPER_OPEN_WIDTH}m = 70mm, prevents 80mm endstop overflow)")
     parser.add_argument("--close-delay-steps", type=int, default=2,
                         help="Debounce steps before closing gripper (default: 2)")
     parser.add_argument("--flip-lr", action="store_true", default=False,
@@ -727,6 +730,7 @@ def main():
     else:
         print(f"[*] Sync Steps:        {args.sync_steps} steps (Pause: {args.settle_time * 1000:.0f}ms)")
     print(f"[*] Hard Table Floor:  Z >= {args.z_min * 1000.0:.1f} mm")
+    print(f"[*] Gripper Open Max:  {args.gripper_open_width * 1000.0:.1f} mm (Safe clearance from 80mm hardstop)")
     print(f"[*] Max Speed:         {args.max_vel:.2f} rad/s")
     print("-" * 80)
 
