@@ -134,23 +134,37 @@ class DualRealSenseStreamer:
             t.join(timeout=2.0)
 
 
-def send_json(conn: socket.socket, obj: dict):
-    payload = json.dumps(obj).encode("utf-8")
-    conn.sendall(struct.pack("!I", len(payload)) + payload)
-
-
-def recv_json(conn: socket.socket) -> Optional[dict]:
-    header = conn.recv(4)
-    if not header or len(header) < 4:
-        return None
-    size = struct.unpack("!I", header)[0]
+def _recv_exact(conn: socket.socket, n: int) -> Optional[bytes]:
     data = bytearray()
-    while len(data) < size:
-        chunk = conn.recv(size - len(data))
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
         if not chunk:
             return None
         data.extend(chunk)
-    return json.loads(data.decode("utf-8"))
+    return bytes(data)
+
+
+def send_json(conn: socket.socket, obj: dict) -> bool:
+    try:
+        payload = json.dumps(obj).encode("utf-8")
+        conn.sendall(struct.pack("!I", len(payload)) + payload)
+        return True
+    except (socket.error, ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
+        return False
+
+
+def recv_json(conn: socket.socket) -> Optional[dict]:
+    try:
+        header = _recv_exact(conn, 4)
+        if header is None:
+            return None
+        size = struct.unpack("!I", header)[0]
+        data = _recv_exact(conn, size)
+        if data is None:
+            return None
+        return json.loads(data.decode("utf-8"))
+    except (socket.error, ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError, json.JSONDecodeError):
+        return None
 
 
 def main():

@@ -38,7 +38,43 @@ import threading
 import queue
 import numpy as np
 
-import rospy
+try:
+    import rospy
+except ImportError:
+    # Fallback mock rospy for non-ROS / Windows environments
+    class _MockRate:
+        def __init__(self, hz):
+            self.dt = 1.0 / float(hz)
+        def sleep(self):
+            time.sleep(self.dt)
+
+    class _MockRospyCore:
+        @staticmethod
+        def is_initialized():
+            return True
+
+    class _MockRospy:
+        core = _MockRospyCore
+        @staticmethod
+        def is_shutdown():
+            return False
+        @staticmethod
+        def Rate(hz):
+            return _MockRate(hz)
+        @staticmethod
+        def sleep(t):
+            time.sleep(t)
+        @staticmethod
+        def logwarn(msg):
+            print(f"[WARN] {msg}")
+        @staticmethod
+        def loginfo(msg):
+            print(f"[INFO] {msg}")
+        @staticmethod
+        def init_node(*args, **kwargs):
+            pass
+
+    rospy = _MockRospy()
 
 # Import kinematics module (supports both local Linux directory and Windows package)
 try:
@@ -94,29 +130,36 @@ MAX_JOINT_VEL = 0.35          # 0.35 rad/s max safe testing speed
 MAX_JOINT_ACC = 1.5           # 1.5 rad/s^2 smooth responsive acceleration clamp
 
 
+def _recv_exact(conn, n):
+    data = bytearray()
+    while len(data) < n:
+        chunk = conn.recv(n - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+    return bytes(data)
+
+
 def send_json(conn, obj):
     try:
         payload = json.dumps(obj).encode("utf-8")
         conn.sendall(struct.pack("!I", len(payload)) + payload)
         return True
-    except (socket.error, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+    except (socket.error, ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError):
         return False
 
 
 def recv_json(conn):
     try:
-        header = conn.recv(4)
-        if not header or len(header) < 4:
+        header = _recv_exact(conn, 4)
+        if header is None:
             return None
         size = struct.unpack("!I", header)[0]
-        data = bytearray()
-        while len(data) < size:
-            chunk = conn.recv(size - len(data))
-            if not chunk:
-                return None
-            data.extend(chunk)
+        data = _recv_exact(conn, size)
+        if data is None:
+            return None
         return json.loads(data.decode("utf-8"))
-    except (socket.error, ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
+    except (socket.error, ConnectionResetError, BrokenPipeError, ConnectionAbortedError, OSError, json.JSONDecodeError):
         return None
 
 
@@ -167,6 +210,9 @@ class AsyncChunkClient:
         except queue.Empty:
             return None
 
+    def is_alive(self):
+        return self.thread.is_alive()
+
     def stop(self):
         self.stop_event.set()
         self.thread.join(timeout=1.0)
@@ -201,7 +247,7 @@ def run_rtc_loop(arm, conn, args):
     print("  REAL-TIME CHUNKING (RTC) CONTINUOUS STREAMING ACTIVE")
     print(f"  [Config] Control Frequency: {CONTROL_HZ} Hz (DT = {DT * 1000:.1f} ms)")
     print(f"  [Config] Prefetch Timing:   Step {args.preempt_step} ({args.preempt_step * DT * 1000:.0f} ms)")
-    print(f"  [Config] Receding Window:   {args.blend_steps} steps ({args.blend_steps * DT * 1000:.0f} ms blend)")
+    print(f"  [Config] Rolling Stride:    {args.steps_per_chunk} steps ({args.steps_per_chunk * DT * 1000:.0f} ms)")
     print(f"  [Config] Hard Floor Guard:  Z >= {args.z_min * 1000.0:.1f} mm")
     print(f"  [Config] Max Speed Clamp:   {args.max_vel:.2f} rad/s")
     print("=" * 80)
@@ -231,7 +277,8 @@ def run_rtc_loop(arm, conn, args):
     action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
     use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
 
-    print(f"[Bootstrap OK] Received Chunk 0 ({len(pos_targets) if use_pos else len(vel_targets)} steps, Infer: {active_chunk.get('latency_ms', 0):.0f}ms). Starting continuous RTC...")
+    total_steps = len(pos_targets) if use_pos else len(vel_targets)
+    print(f"[Bootstrap OK] Received Chunk 0 ({total_steps} steps, Infer: {active_chunk.get('latency_ms', 0):.0f}ms). Starting continuous RTC...")
 
     step_in_chunk = 0
     prefetch_sent = False
@@ -274,6 +321,8 @@ def run_rtc_loop(arm, conn, args):
                 pos_targets = active_chunk.get("joint_positions", [])
                 vel_targets = active_chunk.get("joint_velocities", [])
                 grip_targets = active_chunk.get("gripper", [])
+                action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
+                use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
                 step_in_chunk = 0
                 prefetch_sent = False
                 next_chunk = None
@@ -283,7 +332,14 @@ def run_rtc_loop(arm, conn, args):
 
             # 4. Target extraction & Starvation Fallback
             total_steps = len(pos_targets) if use_pos else len(vel_targets)
+            if total_steps == 0:
+                print(f"  [RTC #{chunk_idx:03d}] Error: Empty target chunk received. Terminating.")
+                break
+
             if step_in_chunk >= total_steps:
+                if not client.is_alive():
+                    print(f"  [RTC #{chunk_idx:03d}] GPU Agent connection terminated. Exiting.")
+                    break
                 # Starvation fallback: wait briefly for fresh chunk
                 print(f"  [RTC #{chunk_idx:03d}] Buffer Starvation! Waiting for next chunk...")
                 fresh = client.get_chunk(block=True, timeout=0.5)
@@ -292,14 +348,22 @@ def run_rtc_loop(arm, conn, args):
                     pos_targets = active_chunk.get("joint_positions", [])
                     vel_targets = active_chunk.get("joint_velocities", [])
                     grip_targets = active_chunk.get("gripper", [])
+                    action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
+                    use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
                     step_in_chunk = 0
                     prefetch_sent = False
                     chunk_idx += 1
                     continue
                 else:
                     if not prefetch_sent:
-                        client.request_chunk(state_msg)
-                        prefetch_sent = True
+                        req_msg = {
+                            "loop": chunk_idx + 1,
+                            "q": curr_q.tolist(),
+                            "pos": curr_pos.tolist(),
+                            "gripper": read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0))
+                        }
+                        if client.request_chunk(req_msg):
+                            prefetch_sent = True
                     arm.stop()
                     prev_dq = np.zeros(7)
                     rate.sleep()
@@ -345,6 +409,13 @@ def run_rtc_loop(arm, conn, args):
             if clamped:
                 p_now = forward_kinematics(curr_q)[:3, 3]
                 print(f"  [FLOOR GUARD] Z limit enforced: EE Z={p_now[2] * 1000.0:.1f}mm >= {args.z_min * 1000.0:.1f}mm")
+
+            # Final joint limit verification after floor projection
+            for i in range(7):
+                if (curr_q[i] + dq_safe[i] * DT) < FRANKA_JOINT_LIMITS[i][0] and dq_safe[i] < 0:
+                    dq_safe[i] = 0.0
+                elif (curr_q[i] + dq_safe[i] * DT) > FRANKA_JOINT_LIMITS[i][1] and dq_safe[i] > 0:
+                    dq_safe[i] = 0.0
 
             # 7. Publish velocity to 1kHz controller
             if not args.shadow:
@@ -463,6 +534,15 @@ def run_sync_loop(arm, conn, args):
                     q_des = np.array(pos_targets[step], dtype=np.float64)
                     pos_err = q_des - curr_q_live
                     dq_target = args.kp_pos * pos_err
+
+                    # Real-time closed-loop vertical orientation locking
+                    z_live = forward_kinematics(curr_q_live)[:3, 2]
+                    w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
+                    if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
+                        J = analytical_jacobian(curr_q_live)
+                        J_w = J[3:, :]
+                        J_w_pinv = J_w.T @ np.linalg.inv(J_w @ J_w.T + 1e-4 * np.eye(3))
+                        dq_target += J_w_pinv @ (3.0 * w_tilt)
                 else:
                     dq_target = np.array(vels[step], dtype=np.float64)
 
@@ -475,8 +555,23 @@ def run_sync_loop(arm, conn, args):
                 max_delta = MAX_JOINT_ACC * DT
                 dq_smooth = np.clip(dq_target, prev_dq - max_delta, prev_dq + max_delta)
 
+                # Joint soft limits protection
+                q_pred = curr_q_live + dq_smooth * DT
+                for i in range(7):
+                    if q_pred[i] < FRANKA_JOINT_LIMITS[i][0] and dq_smooth[i] < 0:
+                        dq_smooth[i] = 0.0
+                    elif q_pred[i] > FRANKA_JOINT_LIMITS[i][1] and dq_smooth[i] > 0:
+                        dq_smooth[i] = 0.0
+
                 # Floor collision check
                 dq_safe, clamped = project_velocity_z_floor(curr_q_live, dq_smooth, dt=DT, z_floor=args.z_min)
+
+                # Final joint limit verification after floor projection
+                for i in range(7):
+                    if (curr_q_live[i] + dq_safe[i] * DT) < FRANKA_JOINT_LIMITS[i][0] and dq_safe[i] < 0:
+                        dq_safe[i] = 0.0
+                    elif (curr_q_live[i] + dq_safe[i] * DT) > FRANKA_JOINT_LIMITS[i][1] and dq_safe[i] > 0:
+                        dq_safe[i] = 0.0
 
                 # Soft deceleration near cycle end
                 rem = steps_to_exec - 1 - step
@@ -535,8 +630,10 @@ def main():
                         help="Steps per cycle in sync mode (default: 15)")
     parser.add_argument("--settle-time", type=float, default=0.05,
                         help="Stationary settling time before inference in sync mode (default: 0.05s)")
+    parser.add_argument("--steps-per-chunk", type=int, default=DEFAULT_STEPS_PER_CHUNK,
+                        help=f"Rolling stride steps before chunk handover (default: {DEFAULT_STEPS_PER_CHUNK} @ 15Hz = 533ms)")
     parser.add_argument("--preempt-step", type=int, default=PREEMPT_STEP,
-                        help="Step to trigger async prefetch in RTC mode (default: 6)")
+                        help=f"Step to trigger async prefetch in RTC mode (default: {PREEMPT_STEP} @ 15Hz = 67ms)")
     parser.add_argument("--blend-steps", type=int, default=DEFAULT_BLEND_STEPS,
                         help="Steps over which to blend overlapping chunks in RTC mode (default: 3)")
     parser.add_argument("--max-vel", type=float, default=MAX_JOINT_VEL,
@@ -565,7 +662,7 @@ def main():
     print(f"[*] Port:              {args.port}")
     print(f"[*] Mode:              {mode_str}")
     if args.rtc:
-        print(f"[*] RTC Handover:      Step {args.preempt_step} (Prefetch) -> Blend {args.blend_steps} steps")
+        print(f"[*] RTC Handover:      Step {args.preempt_step} (Prefetch) -> Stride {args.steps_per_chunk} steps")
     else:
         print(f"[*] Sync Steps:        {args.sync_steps} steps (Pause: {args.settle_time * 1000:.0f}ms)")
     print(f"[*] Hard Table Floor:  Z >= {args.z_min * 1000.0:.1f} mm")

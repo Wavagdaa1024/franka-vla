@@ -192,7 +192,7 @@ def correct_step_nullspace(
 def lock_gripper_vertical_downward(
     curr_q: np.ndarray,
     target_pos: np.ndarray,
-    max_iters: int = 8,
+    max_iters: int = 10,
     tol_pos: float = 1e-4,
     tol_rot: float = 1e-4,
     damping: float = 1e-3
@@ -288,10 +288,22 @@ def correct_chunk_nullspace(
         curr, tilt_deg = lock_gripper_vertical_downward(
             curr,
             target_pos=p_target,
-            max_iters=8,
+            max_iters=10,
             tol_pos=1e-4,
             tol_rot=1e-4
         )
+
+        # Safety post-check: if IK residual resulted in Z < z_floor, re-solve targeting slightly above floor
+        p_check = forward_kinematics(curr)[:3, 3]
+        if p_check[2] < z_floor:
+            curr, tilt_deg = lock_gripper_vertical_downward(
+                curr,
+                target_pos=np.array([p_target[0], p_target[1], z_floor + 2e-4]),
+                max_iters=8,
+                tol_pos=5e-5,
+                tol_rot=1e-4
+            )
+
         if tilt_deg > max_tilt_deg:
             max_tilt_deg = tilt_deg
 
