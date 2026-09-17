@@ -192,7 +192,7 @@ def correct_step_nullspace(
 def lock_gripper_vertical_downward(
     curr_q: np.ndarray,
     target_pos: np.ndarray,
-    max_iters: int = 10,
+    max_iters: int = 15,
     tol_pos: float = 1e-4,
     tol_rot: float = 1e-4,
     damping: float = 1e-3
@@ -288,7 +288,7 @@ def correct_chunk_nullspace(
         curr, tilt_deg = lock_gripper_vertical_downward(
             curr,
             target_pos=p_target,
-            max_iters=10,
+            max_iters=15,
             tol_pos=1e-4,
             tol_rot=1e-4
         )
@@ -299,7 +299,7 @@ def correct_chunk_nullspace(
             curr, tilt_deg = lock_gripper_vertical_downward(
                 curr,
                 target_pos=np.array([p_target[0], p_target[1], z_floor + 2e-4]),
-                max_iters=8,
+                max_iters=12,
                 tol_pos=5e-5,
                 tol_rot=1e-4
             )
@@ -332,18 +332,27 @@ def project_velocity_z_floor(
     p_curr = forward_kinematics(curr_q)[:3, 3]
     p_pred = forward_kinematics(curr_q + dq * dt)[:3, 3]
 
-    if p_pred[2] < z_floor:
+    if p_pred[2] < z_floor or p_curr[2] < z_floor:
         J = analytical_jacobian(curr_q)
-        J_vz = J[2:3, :] # 1x7 row vector for Z linear velocity
-        v_z = float(J_vz @ dq)
+        J_vz = J[2:3, :]  # 1x7 row vector for Z linear velocity
+        v_z = float(np.dot(J_vz.flatten(), dq))
+
+        # If already below floor: freeze completely unless moving upwards to escape
+        if p_curr[2] < z_floor:
+            if v_z <= 1e-4:
+                return np.zeros(7, dtype=np.float64), True
+            else:
+                return dq, True
+
         if v_z < 0.0:
             # Downward velocity component to be removed
-            J_vz_pinv = J_vz.T / (np.dot(J_vz.flatten(), J_vz.flatten()) + damping ** 2)
+            denom = float(np.dot(J_vz.flatten(), J_vz.flatten()) + damping ** 2)
+            J_vz_pinv = J_vz.T / denom
             dq_filtered = dq - J_vz_pinv.flatten() * v_z
             # Re-check prediction
             p_recheck = forward_kinematics(curr_q + dq_filtered * dt)[:3, 3]
             if p_recheck[2] < z_floor:
-                # If still below floor due to initial state, freeze velocity completely
+                # If still below floor, freeze velocity completely
                 return np.zeros(7, dtype=np.float64), True
             return dq_filtered, True
 

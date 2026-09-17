@@ -355,6 +355,46 @@ def test_rtc_timing_and_delayed_handover():
     print("  [PASS] RTC seamlessly handles delayed chunk arrival up to step 14 without starvation!")
 
 
+def test_closed_loop_orientation_nullspace_lock():
+    print("\n--- [Test 10/10] Real-Time Closed-Loop Nullspace Orientation Feedback ---")
+    from franka_teleop.kinematics import damped_pinv
+    q_curr = np.array([0.1329, 0.4759, 0.0550, -2.4485, 0.0220, 2.8999, 0.9361], dtype=np.float64)
+    # Induce 3.0 deg tilt disturbance
+    q_dist = q_curr.copy()
+    q_dist[4] += 0.05
+
+    z_live = forward_kinematics(q_dist)[:3, 2]
+    z_des = np.array([0.0, 0.0, -1.0])
+    tilt_init = float(np.degrees(np.arccos(np.dot(z_live, z_des))))
+    w_tilt = np.cross(z_live, z_des)
+
+    J = analytical_jacobian(q_dist)
+    J_v = J[:3, :]
+    J_w = J[3:, :]
+    J_v_pinv = damped_pinv(J_v, damping=1e-4)
+    N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
+    J_w_null = J_w @ N_v
+    J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
+    dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
+
+    # 1. Check Cartesian linear velocity induced by orientation correction
+    v_linear = J_v @ dq_orient
+    linear_drift_mm_s = float(np.linalg.norm(v_linear)) * 1000.0
+
+    # 2. Check orientation convergence
+    q_next = q_dist + dq_orient * 0.0667
+    z_next = forward_kinematics(q_next)[:3, 2]
+    tilt_next = float(np.degrees(np.arccos(np.dot(z_next, z_des))))
+
+    print(f"  Initial Tilt Error:    {tilt_init:.3f} deg")
+    print(f"  Next Tilt Error:       {tilt_next:.3f} deg (reduced by {tilt_init - tilt_next:.3f} deg)")
+    print(f"  Linear Position Drift: {linear_drift_mm_s:.8f} mm/s (< 0.0001 mm/s)")
+
+    assert tilt_next < tilt_init, "Orientation correction failed to reduce tilt!"
+    assert linear_drift_mm_s < 0.0001, f"Orientation correction induced linear drift: {linear_drift_mm_s} mm/s"
+    print("  [PASS] Closed-loop nullspace orientation feedback eliminates tilt with zero Cartesian drift!")
+
+
 def run_all():
     print("=" * 75)
     print("  FRANKA KINEMATICS, TABLE FLOOR GUARD, & RTC SUITE VERIFICATION")
@@ -368,8 +408,9 @@ def run_all():
     test_strict_gripper_vertical_downward_ik()
     test_tcp_packet_framing_and_fragmentation()
     test_rtc_timing_and_delayed_handover()
+    test_closed_loop_orientation_nullspace_lock()
     print("\n" + "=" * 75)
-    print("  ALL 9 TESTS PASSED 100% PERFECTLY!")
+    print("  ALL 10 TESTS PASSED 100% PERFECTLY!")
     print("=" * 75)
 
 

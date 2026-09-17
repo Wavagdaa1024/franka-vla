@@ -81,6 +81,7 @@ try:
     from kinematics import (
         forward_kinematics,
         analytical_jacobian,
+        damped_pinv,
         project_velocity_z_floor,
         DEFAULT_Z_FLOOR,
         FRANKA_JOINT_LIMITS
@@ -89,6 +90,7 @@ except ImportError:
     from franka_teleop.kinematics import (
         forward_kinematics,
         analytical_jacobian,
+        damped_pinv,
         project_velocity_z_floor,
         DEFAULT_Z_FLOOR,
         FRANKA_JOINT_LIMITS
@@ -155,6 +157,8 @@ def recv_json(conn):
         if header is None:
             return None
         size = struct.unpack("!I", header)[0]
+        if size == 0 or size > 10 * 1024 * 1024:  # 10MB safety bound
+            return None
         data = _recv_exact(conn, size)
         if data is None:
             return None
@@ -167,6 +171,10 @@ class AsyncChunkClient:
     """Asynchronous background worker for continuous streaming & prefetching."""
     def __init__(self, conn):
         self.conn = conn
+        try:
+            self.conn.settimeout(10.0)
+        except Exception:
+            pass
         self.req_queue = queue.Queue(maxsize=1)
         self.resp_queue = queue.Queue(maxsize=2)
         self.stop_event = threading.Event()
@@ -210,11 +218,23 @@ class AsyncChunkClient:
         except queue.Empty:
             return None
 
+    def drain_responses(self):
+        """Discards any unconsumed responses to maintain strict 1:1 chunk synchrony."""
+        while not self.resp_queue.empty():
+            try:
+                self.resp_queue.get_nowait()
+            except queue.Empty:
+                break
+
     def is_alive(self):
         return self.thread.is_alive()
 
     def stop(self):
         self.stop_event.set()
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
         self.thread.join(timeout=1.0)
 
 
@@ -278,13 +298,18 @@ def run_rtc_loop(arm, conn, args):
     use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
 
     total_steps = len(pos_targets) if use_pos else len(vel_targets)
+    if total_steps == 0:
+        print("[ERROR] Bootstrap action chunk contains no waypoints!")
+        client.stop()
+        return 0, t_start
+
     print(f"[Bootstrap OK] Received Chunk 0 ({total_steps} steps, Infer: {active_chunk.get('latency_ms', 0):.0f}ms). Starting continuous RTC...")
 
     step_in_chunk = 0
     prefetch_sent = False
-    blending = False
-    blend_step = 0
     next_chunk = None
+    t_starve_start = None
+    MAX_STARVATION_SECS = 5.0
 
     try:
         while not rospy.is_shutdown():
@@ -327,6 +352,8 @@ def run_rtc_loop(arm, conn, args):
                 prefetch_sent = False
                 next_chunk = None
                 chunk_idx += 1
+                t_starve_start = None
+                client.drain_responses()
                 p_now, _ = arm.get_cartesian_pose()
                 print(f"[Continuous Handover #{chunk_idx:03d}] EE: [{p_now[0]:.3f}, {p_now[1]:.3f}, {p_now[2]:.3f}] | Continuous Stream")
 
@@ -340,6 +367,12 @@ def run_rtc_loop(arm, conn, args):
                 if not client.is_alive():
                     print(f"  [RTC #{chunk_idx:03d}] GPU Agent connection terminated. Exiting.")
                     break
+                if t_starve_start is None:
+                    t_starve_start = time.time()
+                elif time.time() - t_starve_start > MAX_STARVATION_SECS:
+                    print(f"  [RTC #{chunk_idx:03d}] Buffer starvation timeout (> {MAX_STARVATION_SECS:.1f}s). Exiting safely.")
+                    break
+
                 # Starvation fallback: wait briefly for fresh chunk
                 print(f"  [RTC #{chunk_idx:03d}] Buffer Starvation! Waiting for next chunk...")
                 fresh = client.get_chunk(block=True, timeout=0.5)
@@ -353,6 +386,8 @@ def run_rtc_loop(arm, conn, args):
                     step_in_chunk = 0
                     prefetch_sent = False
                     chunk_idx += 1
+                    t_starve_start = None
+                    client.drain_responses()
                     continue
                 else:
                     if not prefetch_sent:
@@ -368,20 +403,30 @@ def run_rtc_loop(arm, conn, args):
                     prev_dq = np.zeros(7)
                     rate.sleep()
                     continue
+            else:
+                t_starve_start = None
 
             if use_pos:
                 q_des = np.array(pos_targets[step_in_chunk], dtype=np.float64)
                 pos_err = q_des - curr_q
                 dq_target = args.kp_pos * pos_err
 
-                # Real-time closed-loop vertical orientation locking
+                # Real-time closed-loop vertical orientation locking in position nullspace
                 z_live = forward_kinematics(curr_q)[:3, 2]
                 w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
                 if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
                     J = analytical_jacobian(curr_q)
+                    J_v = J[:3, :]
                     J_w = J[3:, :]
-                    J_w_pinv = J_w.T @ np.linalg.inv(J_w @ J_w.T + 1e-4 * np.eye(3))
-                    dq_target += J_w_pinv @ (3.0 * w_tilt)
+                    J_v_pinv = damped_pinv(J_v, damping=1e-4)
+                    N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
+                    J_w_null = J_w @ N_v
+                    J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
+                    dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
+                    dq_orient_norm = np.linalg.norm(dq_orient)
+                    if dq_orient_norm > 0.15:
+                        dq_orient = dq_orient * (0.15 / dq_orient_norm)
+                    dq_target += dq_orient
             else:
                 dq_target = np.array(vel_targets[step_in_chunk], dtype=np.float64)
 
@@ -416,6 +461,10 @@ def run_rtc_loop(arm, conn, args):
                     dq_safe[i] = 0.0
                 elif (curr_q[i] + dq_safe[i] * DT) > FRANKA_JOINT_LIMITS[i][1] and dq_safe[i] > 0:
                     dq_safe[i] = 0.0
+
+            # Absolute floor guard post-check
+            if forward_kinematics(curr_q + dq_safe * DT)[:3, 3][2] < args.z_min:
+                dq_safe = np.zeros(7, dtype=np.float64)
 
             # 7. Publish velocity to 1kHz controller
             if not args.shadow:
@@ -535,14 +584,22 @@ def run_sync_loop(arm, conn, args):
                     pos_err = q_des - curr_q_live
                     dq_target = args.kp_pos * pos_err
 
-                    # Real-time closed-loop vertical orientation locking
+                    # Real-time closed-loop vertical orientation locking in position nullspace
                     z_live = forward_kinematics(curr_q_live)[:3, 2]
                     w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
                     if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
                         J = analytical_jacobian(curr_q_live)
+                        J_v = J[:3, :]
                         J_w = J[3:, :]
-                        J_w_pinv = J_w.T @ np.linalg.inv(J_w @ J_w.T + 1e-4 * np.eye(3))
-                        dq_target += J_w_pinv @ (3.0 * w_tilt)
+                        J_v_pinv = damped_pinv(J_v, damping=1e-4)
+                        N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
+                        J_w_null = J_w @ N_v
+                        J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
+                        dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
+                        dq_orient_norm = np.linalg.norm(dq_orient)
+                        if dq_orient_norm > 0.15:
+                            dq_orient = dq_orient * (0.15 / dq_orient_norm)
+                        dq_target += dq_orient
                 else:
                     dq_target = np.array(vels[step], dtype=np.float64)
 
@@ -572,6 +629,10 @@ def run_sync_loop(arm, conn, args):
                         dq_safe[i] = 0.0
                     elif (curr_q_live[i] + dq_safe[i] * DT) > FRANKA_JOINT_LIMITS[i][1] and dq_safe[i] > 0:
                         dq_safe[i] = 0.0
+
+                # Absolute floor guard post-check
+                if forward_kinematics(curr_q_live + dq_safe * DT)[:3, 3][2] < args.z_min:
+                    dq_safe = np.zeros(7, dtype=np.float64)
 
                 # Soft deceleration near cycle end
                 rem = steps_to_exec - 1 - step

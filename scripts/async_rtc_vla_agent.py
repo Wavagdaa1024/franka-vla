@@ -159,6 +159,8 @@ def recv_json(conn: socket.socket) -> Optional[dict]:
         if header is None:
             return None
         size = struct.unpack("!I", header)[0]
+        if size == 0 or size > 10 * 1024 * 1024:  # 10MB safety bound
+            return None
         data = _recv_exact(conn, size)
         if data is None:
             return None
