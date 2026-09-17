@@ -683,10 +683,10 @@ def run_sync_loop(arm, conn, args):
 def main():
     parser = argparse.ArgumentParser(description="Franka Closed-Loop VLA Execution Service")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Listening port (default: 8765)")
-    parser.add_argument("--rtc", dest="rtc", action="store_true", default=True,
-                        help="Enable Real-Time Chunking continuous streaming mode (default: True)")
-    parser.add_argument("--sync", dest="rtc", action="store_false",
-                        help="Enable synchronous Stop-and-Go mode (fallback)")
+    parser.add_argument("--sync", dest="rtc", action="store_false", default=False,
+                        help="Enable synchronous Stop-and-Go mode (default: True)")
+    parser.add_argument("--rtc", dest="rtc", action="store_true",
+                        help="Enable Real-Time Chunking continuous streaming mode (experimental)")
     parser.add_argument("--sync-steps", type=int, default=DEFAULT_SYNC_STEPS,
                         help="Steps per cycle in sync mode (default: 15)")
     parser.add_argument("--settle-time", type=float, default=0.05,
