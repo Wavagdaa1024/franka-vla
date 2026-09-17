@@ -31,9 +31,12 @@ import random
 from pathlib import Path
 from collections import defaultdict
 
-# Enforce strict physical GPU 1 isolation
+# GPU Device Configuration (defaults to GPU 0 if not explicitly set)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+if "CUDA_VISIBLE_DEVICES" in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"].strip()
+else:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 import numpy as np
@@ -301,7 +304,8 @@ def main():
     print(f"[*] Action Expert:   Rank={args.expert_rank}, Alpha={args.expert_rank*2} (Attention projections)")
     print(f"[*] Action Space:    15-step cumulative relative joint displacement a[k] = q[t+k+1] - q[t]")
     print(f"[*] State Noise:     {args.state_noise:.4f} rad (Anti-Trajectory Memorization)")
-    print(f"[*] Hardware:        Physical GPU 1 (RTX 5090 32GB, CUDA_VISIBLE_DEVICES=1)")
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    print(f"[*] Hardware:        Physical GPU {gpu_id} (RTX 5090 32GB, CUDA_VISIBLE_DEVICES={gpu_id})")
     print("-" * 85)
 
     # 1. Dataset build
