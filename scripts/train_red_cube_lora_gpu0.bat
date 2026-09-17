@@ -13,14 +13,15 @@ if not exist "%PY%" (
 )
 
 echo ===========================================================================
-echo   PI0.5 RED CUBE SINGLE-TASK LoRA TRAINING (DEDICATED GPU 0)
+echo   PI0.5 RED CUBE DEDICATED LoRA TRAINING (GPU 0)
 echo ===========================================================================
 echo   Target GPU:   0 (RTX 5090 32GB, GPU 1 RESERVED FOR LIVE TESTING)
-echo   Dataset:      dataset\teleop_pick_cube_15hz_001
+echo   Task Filter:  "red cube" (Pure Red Cube Training)
+echo   Datasets:     dataset\teleop_pick_cube_15hz_001 dataset\teleop_pick_cube_15hz_002
 echo   Output:       outputs\checkpoints\pi05_lora_red_cube
 echo   Steps:        2000
 echo   Batch:        4 (effective 8 with grad accum 2)
 echo ===========================================================================
 
-"%PY%" -u scripts\train_pi05_lora.py --dataset dataset\teleop_pick_cube_15hz_001 --output-dir outputs\checkpoints\pi05_lora_red_cube --steps 2000 --save-freq 500 --eval-freq 250 %*
+"%PY%" -u scripts\train_pi05_lora.py --dataset dataset\teleop_pick_cube_15hz_001 dataset\teleop_pick_cube_15hz_002 --task-filter "red cube" --output-dir outputs\checkpoints\pi05_lora_red_cube --steps 2000 --save-freq 500 --eval-freq 250 %*
 exit /b %errorlevel%

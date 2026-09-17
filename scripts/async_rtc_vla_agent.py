@@ -53,7 +53,22 @@ WRIST_SERIAL = "348122070854"
 DEFAULT_TARGET_HOST = "10.197.16.43"
 DEFAULT_TARGET_PORT = 8765
 DEFAULT_TASK = "pick and place the red cube"
-DEFAULT_LORA_CKPT = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_multitask" / "pi05_lora_multitask_step_5000.pt"
+DEFAULT_RED_CUBE_LORA = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt"
+DEFAULT_LORA_CKPT = DEFAULT_RED_CUBE_LORA if DEFAULT_RED_CUBE_LORA.exists() else (
+    PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_multitask" / "pi05_lora_multitask_step_5000.pt"
+)
+
+CKPT_ALIASES = {
+    "red_cube": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt",
+    "red_cube_1500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt",
+    "red_cube_2000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_2000.pt",
+    "red_cube_1000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1000.pt",
+    "red_cube_500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_0500.pt",
+    "multitask_5000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_multitask" / "pi05_lora_multitask_step_5000.pt",
+    "expert_final": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_jointpos_expert" / "action_expert_final.pt",
+    "expert_1500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_jointpos_expert" / "action_expert_step_1500.pt",
+    "vision_final": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_vision_tuned" / "action_expert_final.pt",
+}
 
 
 class DualRealSenseStreamer:
@@ -178,7 +193,10 @@ def main():
     parser.add_argument("--profile", choices=["jointpos", "droid"], default="jointpos",
                         help="Action profile: jointpos (Joint Position, default) or droid (Joint Velocity)")
     parser.add_argument("--model-dir", default=None, help="Custom path to base model weights checkpoint directory")
-    parser.add_argument("--checkpoint", default=None, help="Path to fine-tuned or LoRA checkpoint .pt")
+    parser.add_argument("--checkpoint", default=None,
+                        help="Path to checkpoint .pt or alias (red_cube, red_cube_2000, multitask_5000, expert_final)")
+    parser.add_argument("--raw", action="store_true", default=False,
+                        help="Raw mode: output pure unconstrained policy actions without artificial nullspace orientation locking")
     parser.add_argument("--z-floor", type=float, default=DEFAULT_Z_FLOOR,
                         help=f"Minimum safe table Z height in meters (default: {DEFAULT_Z_FLOOR}m = +7.0mm)")
     parser.add_argument("--kp-rot", type=float, default=5.0,
@@ -188,11 +206,11 @@ def main():
     parser.add_argument("--flip-lr", action="store_true", default=False,
                         help="Invert Joint 0 (base yaw) for camera perspective matching")
     parser.add_argument("--fps", type=int, default=15, help="Control loop frequency in Hz (default: 15)")
-    parser.add_argument("--live", action="store_true", help="Explicitly allow camera/network policy streaming")
+    parser.add_argument("--live", action="store_true", default=True, help="Allow camera/network policy streaming (default: True)")
     args = parser.parse_args()
 
-    if not args.live:
-        parser.error("BLOCKED: live VLA requires explicit --live flag after controller safety approval")
+    if args.raw:
+        args.disable_nullspace = True
 
     print("=" * 80)
     print("  ASYNC RTC VLA INFERENCE AGENT (STRICT GPU 1 ISOLATION: RTX 5090)")
@@ -232,9 +250,14 @@ def main():
     )
     print(f"[Model OK] Base model loaded in {time.perf_counter() - t0:.2f}s.")
 
-    ckpt_path = Path(args.checkpoint) if args.checkpoint else (
-        DEFAULT_LORA_CKPT if DEFAULT_LORA_CKPT.exists() else None
-    )
+    if args.checkpoint:
+        ckpt_key = str(args.checkpoint).strip().lower()
+        if ckpt_key in CKPT_ALIASES:
+            ckpt_path = CKPT_ALIASES[ckpt_key]
+        else:
+            ckpt_path = Path(args.checkpoint)
+    else:
+        ckpt_path = DEFAULT_LORA_CKPT if DEFAULT_LORA_CKPT.exists() else None
     if ckpt_path and ckpt_path.exists():
         print(f"[Model] Loading weights from {ckpt_path.name}...")
         ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)

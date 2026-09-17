@@ -97,7 +97,7 @@ def preload_video_frames(video_path: Path):
     return frames
 
 
-def build_multitask_dataset(dataset_dirs):
+def build_multitask_dataset(dataset_dirs, task_filter=None):
     """
     Builds in-memory index of 15-step relative joint position chunks across all datasets:
       a_k = q_{t+k+1} - q_t = sum_{i=0}^k delta_q_{t+i} (for k = 0..14)
@@ -202,6 +202,9 @@ def build_multitask_dataset(dataset_dirs):
                     t_idx = task_indices[start]
                     task_prompt = task_map.get(t_idx, "pick and place the red cube")
 
+                if task_filter and task_filter.lower() not in task_prompt.lower():
+                    continue
+
                 for t in range(start, end - CHUNK_SIZE + 1):
                     all_samples.append({
                         "file_id": file_key,
@@ -287,6 +290,7 @@ def main():
     parser.add_argument("--log-freq", type=int, default=DEFAULT_LOG_FREQ)
     parser.add_argument("--save-freq", type=int, default=DEFAULT_SAVE_FREQ)
     parser.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ)
+    parser.add_argument("--task-filter", type=str, default=None, help="Filter dataset by task substring (e.g. 'red cube')")
     parser.add_argument("--preflight-only", action="store_true", help="Run empirical benchmark and exit")
     args = parser.parse_args()
 
@@ -309,7 +313,7 @@ def main():
     print("-" * 85)
 
     # 1. Dataset build
-    all_samples, cached_files, task_buckets = build_multitask_dataset(args.dataset)
+    all_samples, cached_files, task_buckets = build_multitask_dataset(args.dataset, task_filter=args.task_filter)
     task_names = sorted(list(task_buckets.keys()))
 
     # Pick 1 fixed evaluation sample per task
