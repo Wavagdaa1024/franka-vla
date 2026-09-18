@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Franka Third-Person Camera Fast Alignment & Verification Tool (Dual GUI + Web Edition).
+Franka Third-Person Camera Fast Alignment & Verification Tool (Clean HUD Edition).
 Designed for Franka Imitation Learning (ACT / Diffusion Policy / VLA) and Hand-Eye Calibration.
 
 Features:
 1. RealSense hardware auto-detection & native color intrinsics querying.
 2. 60mm ChArUco 4x4 board sub-pixel pose estimation (solvePnP).
 3. "Golden Baseline" saving and persistent storage (baseline_pose.json).
-4. Real-time delta display: dX, dY, dZ (mm), dRoll, dPitch, dYaw (deg).
-5. Actionable physical adjustment hints (e.g., 向左推 5mm / 俯角下压 1.2度).
-6. Semi-transparent Ghost Overlay (press G to blend baseline reference image).
-7. Big Green "ALIGNED / 已精准复位" status banner when within tolerance.
-8. Dual Display: Native Windows Desktop Window (cv2.imshow) + Web Dashboard (http://10.70.242.38:8088).
+4. Ultra-compact, non-obtrusive semi-transparent HUD (HUD doesn't block workspace).
+5. [H] hotkey: One-click toggle to completely hide/show all overlay text!
+6. Dual Display: Native Windows Desktop Window + Web Dashboard (http://10.70.242.38:8088).
+7. Native compatibility with Hand-Eye Calibration and Franka pose logging.
 
 Hotkeys (Desktop & Web Buttons):
   [S] / Button: Save current pose & image as Golden Baseline
   [G] / Button: Toggle Semi-transparent Ghost Overlay mode
+  [H] / Button: Toggle HUD text display (clean view mode)
   [R] / Button: Reset / clear existing baseline
   [Q] / [ESC] : Exit program
 """
@@ -81,7 +81,7 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
     """Serves Web Dashboard and MJPEG live stream."""
 
     def log_message(self, format, *args):
-        pass  # Suppress logging spam
+        pass
 
     def do_GET(self):
         global latest_jpeg_frame, stream_running, web_command_queue
@@ -113,11 +113,10 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
             text-align: center;
         }
         h1 {
-            font-size: 20px;
+            font-size: 18px;
             color: #4CAF50;
             margin-top: 5px;
-            margin-bottom: 15px;
-            letter-spacing: 0.5px;
+            margin-bottom: 12px;
         }
         img.stream {
             width: 100%;
@@ -129,13 +128,13 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
         .btn-group {
             display: flex;
             justify-content: center;
-            gap: 12px;
+            gap: 10px;
             margin-top: 15px;
             flex-wrap: wrap;
         }
         button {
-            padding: 10px 20px;
-            font-size: 15px;
+            padding: 8px 16px;
+            font-size: 14px;
             font-weight: 600;
             border: none;
             border-radius: 6px;
@@ -143,26 +142,14 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
             transition: 0.2s;
         }
         .btn-save { background: #2E7D32; color: #FFF; }
-        .btn-save:hover { background: #388E3C; }
         .btn-ghost { background: #0277BD; color: #FFF; }
-        .btn-ghost:hover { background: #0288D1; }
+        .btn-hud { background: #555; color: #FFF; }
         .btn-reset { background: #C62828; color: #FFF; }
-        .btn-reset:hover { background: #D32F2F; }
         .toast {
-            margin-top: 12px;
+            margin-top: 10px;
             font-size: 14px;
             color: #81C784;
             min-height: 20px;
-        }
-        .tips {
-            margin-top: 15px;
-            text-align: left;
-            background: #252525;
-            padding: 10px 15px;
-            border-radius: 6px;
-            font-size: 13px;
-            color: #AAA;
-            line-height: 1.6;
         }
     </style>
 </head>
@@ -171,18 +158,12 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
         <h1>FRANKA FRONT CAMERA FAST ALIGNMENT</h1>
         <img class="stream" src="/stream.mjpg" alt="Camera Feed">
         <div class="btn-group">
-            <button class="btn-save" onclick="sendCmd('save')">&#10004; [S] Save Golden Baseline</button>
-            <button class="btn-ghost" onclick="sendCmd('ghost')">&#128065; [G] Toggle Ghost Overlay</button>
-            <button class="btn-reset" onclick="sendCmd('reset')">&#8634; [R] Reset Baseline</button>
+            <button class="btn-save" onclick="sendCmd('save')">&#10004; [S] Save Baseline</button>
+            <button class="btn-ghost" onclick="sendCmd('ghost')">&#128065; [G] Ghost Overlay</button>
+            <button class="btn-hud" onclick="sendCmd('hud')">&#9776; [H] Toggle HUD</button>
+            <button class="btn-reset" onclick="sendCmd('reset')">&#8634; [R] Reset</button>
         </div>
         <div id="toast" class="toast"></div>
-        <div class="tips">
-            <b>操作指南：</b><br>
-            1. 首次使用将相机摆好后，点击 <b>[Save Golden Baseline]</b>（或按键盘 <code>S</code> 键）保存黄金位姿；<br>
-            2. 日常复位时微调三脚架云台，画面上<b>青色实时框</b>对准<b>黄色基准框</b>；<br>
-            3. 点击 <b>[Toggle Ghost Overlay]</b>（或按键盘 <code>G</code> 键）开启 50% 半透明鬼影叠图；<br>
-            4. 误差处于 <code>&le; 3mm / &le; 1.0&deg;</code> 内时，顶部 Banner 自动变绿显示 <b>[ALIGNED]</b>。
-        </div>
     </div>
     <script>
         function sendCmd(cmd) {
@@ -226,7 +207,7 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     self.wfile.write(frame_bytes)
                     self.wfile.write(b"\r\n")
-                    time.sleep(0.033)  # ~30 FPS
+                    time.sleep(0.033)
             except (ConnectionResetError, BrokenPipeError):
                 pass
 
@@ -243,6 +224,13 @@ class AlignmentWebHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.end_headers()
             self.wfile.write("✔ Ghost Mode toggled!".encode("utf-8"))
+
+        elif self.path == "/api/hud":
+            web_command_queue.append("hud")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write("✔ HUD toggled!".encode("utf-8"))
 
         elif self.path == "/api/reset":
             web_command_queue.append("reset")
@@ -279,6 +267,7 @@ class CameraAligner:
         self.baseline = None
         self.baseline_img = None
         self.ghost_mode = False
+        self.show_hud = True  # Can be toggled with 'H' key
         self.load_baseline()
 
         # Setup ChArUco Board & Detector
@@ -330,6 +319,10 @@ class CameraAligner:
             "square_length_m": SQUARE_LENGTH_M,
             "marker_length_m": MARKER_LENGTH_M
         }
+        # Keep existing franka_pose if present
+        if self.baseline and "franka_pose" in self.baseline:
+            data["franka_pose"] = self.baseline["franka_pose"]
+
         with open(self.baseline_json, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
         cv2.imwrite(str(self.baseline_img_path), frame_bgr)
@@ -378,7 +371,6 @@ class CameraAligner:
         color_stream = profile.get_stream(rs.stream.color).as_video_stream_profile()
         intr = color_stream.get_intrinsics()
 
-        # Build OpenCV Camera Matrix K and Distortion Coefficients D
         self.K = np.array([
             [intr.fx, 0.0,     intr.ppx],
             [0.0,     intr.fy, intr.ppy],
@@ -391,7 +383,6 @@ class CameraAligner:
         print("=" * 70)
         print(f"  Device S/N:  {self.serial}")
         print(f"  Resolution:  {self.width}x{self.height} @ {self.fps} FPS")
-        print(f"  Intrinsics:  fx={intr.fx:.1f}, fy={intr.fy:.1f}, cx={intr.ppx:.1f}, cy={intr.ppy:.1f}")
         print(f"  Web Server:  http://localhost:{self.port}  (or http://10.70.242.38:{self.port})")
         print("=" * 70)
 
@@ -404,12 +395,11 @@ class CameraAligner:
         web_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         web_thread.start()
 
-        # Try to initialize native OpenCV desktop window
         win_title = "Franka Camera Alignment Tool (ChArUco)"
         has_gui = False
         try:
             cv2.namedWindow(win_title, cv2.WINDOW_NORMAL)
-            cv2.resizeWindow(win_title, 1100, 750)
+            cv2.resizeWindow(win_title, 960, 720)
             has_gui = True
             print("[INFO] Native desktop GUI window started.")
         except Exception as e:
@@ -428,15 +418,16 @@ class CameraAligner:
                 frame_rgb = np.asanyarray(color_frame.get_data())
                 frame_bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
                 display = frame_bgr.copy()
+                w_disp, h_disp = display.shape[1], display.shape[0]
 
                 # Ghost Overlay Mode
                 if self.ghost_mode and self.baseline_img is not None:
                     if self.baseline_img.shape == display.shape:
                         display = cv2.addWeighted(display, 0.55, self.baseline_img, 0.45, 0)
-                        cv2.putText(display, "[GHOST OVERLAY: ON]", (display.shape[1] - 280, 35),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                        cv2.putText(display, "[GHOST ON]", (w_disp - 110, 20),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-                # ChArUco Board Detection with robust error handling
+                # ChArUco Board Detection
                 target_detected = False
                 curr_tvec = None
                 curr_rvec = None
@@ -462,112 +453,104 @@ class CameraAligner:
                                 pts_2d, _ = cv2.projectPoints(self.outer_corners_3d, rvec, tvec, self.K, self.D)
                                 curr_corners_2d = pts_2d.reshape(-1, 2)
 
-                                # Robust subpixel corner drawing (completely avoids OpenCV 5.0 C++ assertion bug)
+                                # Draw tiny subpixel dots (unobtrusive, 2px radius)
                                 for pt in charucoCorners.reshape(-1, 2):
                                     px, py = int(round(pt[0])), int(round(pt[1]))
-                                    cv2.circle(display, (px, py), 3, (0, 255, 0), -1)
-                                    cv2.circle(display, (px, py), 5, (0, 200, 0), 1)
+                                    cv2.circle(display, (px, py), 2, (0, 255, 0), -1, cv2.LINE_AA)
 
-                                cv2.polylines(display, [np.int32(curr_corners_2d)], isClosed=True, color=(255, 200, 0), thickness=2)
-                                cv2.drawFrameAxes(display, self.K, self.D, rvec, tvec, 0.040, 2)
-                except Exception as detect_err:
-                    pass  # Keep streaming smoothly even if detection glitched
+                                # Thin outline of board
+                                cv2.polylines(display, [np.int32(curr_corners_2d)], isClosed=True,
+                                              color=(255, 200, 0), thickness=1, lineType=cv2.LINE_AA)
+                                cv2.drawFrameAxes(display, self.K, self.D, rvec, tvec, 0.035, 1)
+                except Exception:
+                    pass
 
                 # Draw Baseline Target Box if baseline exists
                 if self.baseline is not None:
                     base_corners = np.array(self.baseline["corners_2d"], dtype=np.int32)
-                    cv2.polylines(display, [base_corners], isClosed=True, color=(0, 230, 255), thickness=2, lineType=cv2.LINE_AA)
-                    cv2.putText(display, "TARGET BASELINE", (base_corners[0][0], max(base_corners[0][1] - 8, 20)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 230, 255), 2)
+                    cv2.polylines(display, [base_corners], isClosed=True,
+                                  color=(0, 230, 255), thickness=1, lineType=cv2.LINE_AA)
 
-                # UI Dashboard & Guidance
-                if target_detected:
-                    t_mm = curr_tvec.flatten() * 1000.0
-                    eu = curr_euler
+                # Render Minimalist HUD (only if self.show_hud is True)
+                if self.show_hud:
+                    if target_detected:
+                        t_mm = curr_tvec.flatten() * 1000.0
+                        eu = curr_euler
 
-                    if self.baseline is not None:
-                        base_t_mm = np.array(self.baseline["tvec_m"]) * 1000.0
-                        base_eu = np.array(self.baseline["euler_deg"])
+                        if self.baseline is not None:
+                            base_t_mm = np.array(self.baseline["tvec_m"]) * 1000.0
+                            base_eu = np.array(self.baseline["euler_deg"])
 
-                        dt_mm = t_mm - base_t_mm
-                        deu = eu - base_eu
-                        deu = (deu + 180.0) % 360.0 - 180.0
+                            dt_mm = t_mm - base_t_mm
+                            deu = eu - base_eu
+                            deu = (deu + 180.0) % 360.0 - 180.0
 
-                        dx, dy, dz = dt_mm[0], dt_mm[1], dt_mm[2]
-                        droll, dpitch, dyaw = deu[0], deu[1], deu[2]
-                        total_pos_err = math.sqrt(dx*dx + dy*dy + dz*dz)
-                        total_ang_err = max(abs(droll), abs(dpitch), abs(dyaw))
+                            dx, dy, dz = dt_mm[0], dt_mm[1], dt_mm[2]
+                            droll, dpitch, dyaw = deu[0], deu[1], deu[2]
+                            total_pos_err = math.sqrt(dx*dx + dy*dy + dz*dz)
+                            total_ang_err = max(abs(droll), abs(dpitch), abs(dyaw))
 
-                        is_aligned = (total_pos_err <= TOLERANCE_POS_MM) and (total_ang_err <= TOLERANCE_ANGLE_DEG)
+                            is_aligned = (total_pos_err <= TOLERANCE_POS_MM) and (total_ang_err <= TOLERANCE_ANGLE_DEG)
 
-                        # Top Status Banner
-                        banner_h = 70
-                        overlay = display.copy()
-                        if is_aligned:
-                            cv2.rectangle(overlay, (0, 0), (display.shape[1], banner_h), (0, 140, 0), -1)
+                            # Slim top status badge (height 22px)
+                            badge_col = (0, 150, 0) if is_aligned else (20, 20, 160)
+                            overlay_top = display.copy()
+                            cv2.rectangle(overlay_top, (0, 0), (w_disp, 22), badge_col, -1)
+                            display = cv2.addWeighted(display, 0.3, overlay_top, 0.7, 0)
+
+                            status_txt = f"[✔ ALIGNED] Err: {total_pos_err:.1f}mm / {total_ang_err:.1f}deg (PASS)" if is_aligned else f"[● ADJUSTING] Err: {total_pos_err:.1f}mm (tol: 3mm) | {total_ang_err:.1f}deg"
+                            cv2.putText(display, status_txt, (10, 16),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+                            # Compact, semi-transparent corner HUD (190px x 115px)
+                            hud_x, hud_y = 10, 28
+                            hud_w, hud_h = 190, 115
+                            sub_img = display[hud_y:hud_y+hud_h, hud_x:hud_x+hud_w]
+                            black_rect = np.zeros_like(sub_img)
+                            display[hud_y:hud_y+hud_h, hud_x:hud_x+hud_w] = cv2.addWeighted(sub_img, 0.45, black_rect, 0.55, 0)
+                            cv2.rectangle(display, (hud_x, hud_y), (hud_x+hud_w, hud_y+hud_h), (80, 80, 80), 1, cv2.LINE_AA)
+
+                            lines = [
+                                (f"dX:    {dx:+5.1f}mm", "OK" if abs(dx) <= 1.5 else ("<- LEFT" if dx > 0 else "RIGHT ->")),
+                                (f"dY:    {dy:+5.1f}mm", "OK" if abs(dy) <= 1.5 else ("UP" if dy > 0 else "DOWN")),
+                                (f"dZ:    {dz:+5.1f}mm", "OK" if abs(dz) <= 2.0 else ("FWD" if dz > 0 else "BACK")),
+                                (f"Pitch: {dpitch:+4.1f}d", "OK" if abs(dpitch) <= 0.8 else ("UP" if dpitch > 0 else "DOWN")),
+                                (f"Yaw:   {dyaw:+4.1f}d", "OK" if abs(dyaw) <= 0.8 else ("LEFT" if dyaw > 0 else "RIGHT")),
+                                (f"Roll:  {droll:+4.1f}d", "OK" if abs(droll) <= 0.8 else "LEVEL")
+                            ]
+                            for idx, (l1, l2) in enumerate(lines):
+                                col = (0, 255, 0) if l2 == "OK" else (0, 200, 255)
+                                cv2.putText(display, f"{l1} {l2}", (hud_x + 6, hud_y + 16 + idx * 17),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.38, col, 1, cv2.LINE_AA)
                         else:
-                            cv2.rectangle(overlay, (0, 0), (display.shape[1], banner_h), (20, 20, 180), -1)
-                        display = cv2.addWeighted(display, 0.25, overlay, 0.75, 0)
-
-                        if is_aligned:
-                            cv2.putText(display, "[ALIGNED] CAMERA RESTORED TO TARGET POSE", (20, 32),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-                            cv2.putText(display, f"Pos Error: {total_pos_err:.1f} mm <= {TOLERANCE_POS_MM} mm | Angle: {total_ang_err:.1f} deg <= {TOLERANCE_ANGLE_DEG} deg (PASS)",
-                                        (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 255, 200), 1)
-                        else:
-                            cv2.putText(display, "[ADJUSTING] CAMERA POSE MISALIGNED", (20, 32),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-                            cv2.putText(display, f"Pos Error: {total_pos_err:.1f} mm (Tol: {TOLERANCE_POS_MM}mm) | Angle: {total_ang_err:.1f} deg (Tol: {TOLERANCE_ANGLE_DEG}deg)",
-                                        (20, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 255), 1)
-
-                        # Side Guidance Panel
-                        p_x, p_y = 15, 95
-                        cv2.rectangle(display, (p_x - 5, p_y - 18), (p_x + 360, p_y + 195), (15, 15, 15), -1)
-                        cv2.rectangle(display, (p_x - 5, p_y - 18), (p_x + 360, p_y + 195), (90, 90, 90), 1)
-
-                        cv2.putText(display, "--- 6-DoF DELTA & HINTS ---", (p_x, p_y),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-
-                        hints = []
-                        hints.append((f"dX:    {dx:+5.1f} mm", "Shift LEFT" if dx > 1.5 else ("Shift RIGHT" if dx < -1.5 else "OK")))
-                        hints.append((f"dY:    {dy:+5.1f} mm", "Raise UP" if dy > 1.5 else ("Lower DOWN" if dy < -1.5 else "OK")))
-                        hints.append((f"dZ:    {dz:+5.1f} mm", "Move FORWARD" if dz > 2.0 else ("Move BACK" if dz < -2.0 else "OK")))
-                        hints.append((f"Pitch: {dpitch:+5.1f} deg", "Tilt UP" if dpitch > 0.8 else ("Tilt DOWN" if dpitch < -0.8 else "OK")))
-                        hints.append((f"Yaw:   {dyaw:+5.1f} deg", "Pan LEFT" if dyaw > 0.8 else ("Pan RIGHT" if dyaw < -0.8 else "OK")))
-                        hints.append((f"Roll:  {droll:+5.1f} deg", "Roll Level" if abs(droll) > 0.8 else "OK"))
-
-                        for idx, (val_str, act_str) in enumerate(hints):
-                            col = (0, 255, 0) if act_str == "OK" else (0, 165, 255)
-                            cv2.putText(display, f"{val_str} -> {act_str}", (p_x, p_y + 25 + idx * 26),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                            # Tag detected but no baseline saved
+                            overlay_top = display.copy()
+                            cv2.rectangle(overlay_top, (0, 0), (w_disp, 22), (30, 30, 30), -1)
+                            display = cv2.addWeighted(display, 0.3, overlay_top, 0.7, 0)
+                            cv2.putText(display, "ChArUco Detected! Press [S] to Save Baseline (or via Web)", (10, 16),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA)
                     else:
-                        cv2.rectangle(display, (15, 15), (460, 85), (35, 35, 35), -1)
-                        cv2.putText(display, "ChArUco Detected! No Baseline Saved.", (25, 42),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                        cv2.putText(display, "Position camera, then press [S] to Save Baseline.",
-                                    (25, 68), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-                else:
-                    cv2.rectangle(display, (15, 15), (460, 75), (0, 0, 150), -1)
-                    cv2.putText(display, "[WARN] 60mm ChArUco Board NOT FOUND!", (25, 42),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
-                    cv2.putText(display, "Ensure board is in view and well-illuminated.",
-                                (25, 63), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220, 220, 220), 1)
+                        overlay_top = display.copy()
+                        cv2.rectangle(overlay_top, (0, 0), (w_disp, 22), (0, 0, 120), -1)
+                        display = cv2.addWeighted(display, 0.3, overlay_top, 0.7, 0)
+                        cv2.putText(display, "ChArUco Board Not In View", (10, 16),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1, cv2.LINE_AA)
 
-                # Bottom Hotkey Bar
-                h_disp, w_disp = display.shape[:2]
-                cv2.rectangle(display, (0, h_disp - 32), (w_disp, h_disp), (15, 15, 15), -1)
-                help_text = f"[S] Save Baseline | [G] Ghost Overlay | [R] Reset | Web: http://10.70.242.38:{self.port}"
-                cv2.putText(display, help_text, (15, h_disp - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 180), 1)
+                    # Minimal bottom hotkey bar (height 18px)
+                    overlay_bot = display.copy()
+                    cv2.rectangle(overlay_bot, (0, h_disp - 18), (w_disp, h_disp), (15, 15, 15), -1)
+                    display = cv2.addWeighted(display, 0.4, overlay_bot, 0.6, 0)
+                    help_str = f"[S] Save | [G] Ghost | [H] Hide HUD | [R] Reset | Web: http://10.70.242.38:{self.port}"
+                    cv2.putText(display, help_str, (10, h_disp - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.36, (180, 180, 180), 1, cv2.LINE_AA)
 
-                # Toast Message
-                if flash_message and (time.time() - flash_time < 3.0):
-                    cv2.rectangle(display, (w_disp // 2 - 180, h_disp // 2 - 30),
-                                  (w_disp // 2 + 180, h_disp // 2 + 25), (0, 160, 0), -1)
-                    cv2.putText(display, flash_message, (w_disp // 2 - 160, h_disp // 2 + 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                # Temporary toast notification
+                if flash_message and (time.time() - flash_time < 2.5):
+                    cv2.rectangle(display, (w_disp // 2 - 140, 35), (w_disp // 2 + 140, 65), (0, 140, 0), -1)
+                    cv2.putText(display, flash_message, (w_disp // 2 - 120, 56),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
-                # Update Web JPEG frame buffer
+                # Update Web JPEG buffer
                 ret, jpeg = cv2.imencode(".jpg", display, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
                 if ret:
                     with frame_lock:
@@ -582,10 +565,12 @@ class CameraAligner:
                             flash_message = "Baseline Saved Successfully!"
                             flash_time = time.time()
                         else:
-                            flash_message = "Cannot Save: Board Not Detected!"
+                            flash_message = "Cannot Save: Board Not In View!"
                             flash_time = time.time()
                     elif cmd == "ghost":
                         self.ghost_mode = not self.ghost_mode
+                    elif cmd == "hud":
+                        self.show_hud = not self.show_hud
                     elif cmd == "reset":
                         self.clear_baseline()
                         flash_message = "Baseline Cleared."
@@ -603,10 +588,12 @@ class CameraAligner:
                             flash_message = "Baseline Saved Successfully!"
                             flash_time = time.time()
                         else:
-                            flash_message = "Cannot Save: Board Not Detected!"
+                            flash_message = "Cannot Save: Board Not In View!"
                             flash_time = time.time()
                     elif key in [ord('g'), ord('G')]:
                         self.ghost_mode = not self.ghost_mode
+                    elif key in [ord('h'), ord('H')]:
+                        self.show_hud = not self.show_hud
                     elif key in [ord('r'), ord('R')]:
                         self.clear_baseline()
                         flash_message = "Baseline Cleared."

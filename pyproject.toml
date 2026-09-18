@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vla_franka"
+name = "embodied-midterm"
 version = "0.1.0"
-description = "Franka Panda VLA deployment and teleoperation system with LeRobot integration"
+description = "Franka Panda VLA deployment, LoRA fine-tuning, and obstacle avoidance system with LeRobot integration"
 authors = [{ name = "Midterm Team" }]
 requires-python = ">=3.10"
 dependencies = [

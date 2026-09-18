@@ -1,4 +1,4 @@
-# VLA_franka: Franka Panda 具身智能 VLA 部署工程
+# embodied-midterm: Franka Panda 具身智能 VLA 部署工程
 
 本项目面向 Franka Panda 机械臂具身操作任务，基于 Hugging Face **LeRobot** 规范实现端到端数据采集、Pi0.5 / Gemma LoRA 具身策略微调、三维视觉避障安全滤波与实时 RTC 闭环部署。
 
@@ -7,7 +7,7 @@
 ## 1. 整体目录架构 (Industrial src-layout)
 
 ```text
-VLA_franka/
+embodied-midterm/
 ├── src/                                  <-- 【功能性代码核心统一目录】
 │   ├── franka_teleop/                    <-- 机械臂驱动、RTC闭环服务、Pi0.5引擎、正逆运动学
 │   ├── obstacle_avoidance/               <-- 3D包络感知、Franka胶囊碰撞体、实时安全滤波
