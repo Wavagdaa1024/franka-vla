@@ -5,6 +5,7 @@ cd /d "%~dp0.."
 set "CUDA_DEVICE_ORDER=PCI_BUS_ID"
 set "CUDA_VISIBLE_DEVICES=0"
 set "HF_HUB_OFFLINE=1"
+set "PYTHONPATH=%~dp0..\src;%PYTHONPATH%"
 set "PY=C:\Users\74727\miniconda3\envs\lerobot\python.exe"
 
 if not exist "%PY%" (

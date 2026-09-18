@@ -2,6 +2,7 @@
 setlocal
 cd /d "%~dp0.."
 
+set "PYTHONPATH=%~dp0..\src;%PYTHONPATH%"
 set "PY=C:\Users\74727\miniconda3\envs\lerobot\python.exe"
 
 if not exist "%PY%" (
@@ -10,11 +11,13 @@ if not exist "%PY%" (
 )
 
 echo ===============================================================================
-echo   FRANKA REALSENSE CONTINUOUS LIVE CAMERA STREAM
+echo   FRANKA REALSENSE CONTINUOUS DUAL-CAMERA STREAMER
 echo ===============================================================================
-echo   Local Web URL:  http://localhost:8080
-echo   LAN Web URL:    http://10.70.242.38:8080
-echo   Desktop Window: OpenCV Side-by-Side Dual View (Press Q to exit)
+echo   Python Env:  %PY%
+echo   Front Cam:   Serial 254322072252
+echo   Wrist Cam:   Serial 348122070854
+echo   Resolution:  640x480 @ 30 FPS
+echo   Web Stream:  http://0.0.0.0:5000 (LAN Accessible)
 echo ===============================================================================
 
 "%PY%" -u scripts\live_camera_stream.py %*

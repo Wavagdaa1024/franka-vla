@@ -19,5 +19,5 @@ dependencies = [
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["franka_teleop*", "vlm_planning*"]
+where = ["src"]
+include = ["franka_teleop*", "obstacle_avoidance*", "vlm_planning*"]
