@@ -433,7 +433,10 @@ def main():
                 config=vars(args),
                 mode=args.wandb_mode,
             )
+            run_url = getattr(wandb_run, "url", None)
             print(f"[W&B] Initialized run '{run_name}' in project '{args.wandb_project}' (Mode: {args.wandb_mode})")
+            if run_url:
+                print(f"[W&B URL] Real-Time Cloud Dashboard: {run_url}")
         except Exception as e:
             print(f"[W&B Warning] Online init failed: {e}. Falling back to offline mode...")
             wandb_run = wandb.init(
