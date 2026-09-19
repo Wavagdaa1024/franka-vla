@@ -59,7 +59,16 @@ python3 Teleop_dataset_recorder.py --sample-hz 15
 ## 4. 终端 3：Windows 服务器，启动录制端
 
 > [!TIP]
-> **前置确认相机画面**：在正式录制前，推荐先执行 `.\scripts\live_camera.bat` 确认头部正面与手腕相机画面均正常对准作业台（按 `q` 即可退出），再启动录制端。
+> **自带实时双摄画面与录制状态 HUD**：
+> 录制端启动后将**默认自动弹出实时双摄监控仪表盘**，并同步启动局域网 Web 流媒体服务：
+> - **桌面窗口**：左右并排显示头部与腕部画面，带准心与 FPS 统计；
+> - **录制状态指示条**：
+>   - 未开始时：显示蓝色 `[IDLE / READY]`（等待 Franka 终端按 `s`）；
+>   - 录制中（按 `s` 后）：瞬间变为高亮闪烁的大红条 `● REC [RECORDING]`（显示已录帧数与时长）；
+>   - 保存成功（按 `e` 后）：显示高亮绿色 `✔ [SAVED]`；
+>   - 丢弃该段（按 `d` 后）：显示橙色 `✖ [DISCARDED]`。
+> - **手机 / 平板浏览器查看**：手持 Touch 站在机械臂旁边时，用手机浏览器打开 `http://10.70.242.38:8080` 即可实时盯盘！
+> - *(如需纯后台无窗口静默录制，可添加 `--no-preview` 参数；若只需网页推流不弹桌面窗，可添加 `--no-gui`)*
 
 打开 Windows GPU 服务器终端（PowerShell 或 CMD），进入工程根目录：
 
@@ -80,8 +89,7 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
   --root "C:\Users\74727\Desktop\project\VLA_franka\dataset\teleop_pick_cube_15hz_002" `
   --front-serial 254322072252 `
   --wrist-serial 348122070854 `
-  --fps 15 `
-  --no-preview
+  --fps 15
 ```
 
 #### 等价 Python 完整命令：
@@ -95,8 +103,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\record_teleo
   --root "C:\Users\74727\Desktop\project\VLA_franka\dataset\teleop_pick_cube_15hz_002" `
   --front-serial 254322072252 `
   --wrist-serial 348122070854 `
-  --fps 15 `
-  --no-preview
+  --fps 15
 ```
 
 ---
@@ -114,11 +121,10 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\record_teleo
   --front-serial 254322072252 `
   --wrist-serial 348122070854 `
   --fps 15 `
-  --resume `
-  --no-preview
+  --resume
 ```
 
-> **提示**：如果录制时需要实时预览相机画面，可将 `--no-preview` 替换为 `--preview`。
+> **提示**：录制默认已开启实时双摄画面与 Web 推流；如需无界面静默录制，可添加 `--no-preview`。
 
 ---
 

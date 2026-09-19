@@ -19,6 +19,213 @@ from typing import Any
 
 import numpy as np
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import socketserver
+
+# Global state for web streaming
+_latest_preview_jpeg = None
+_preview_lock = threading.Lock()
+_web_stream_active = False
+
+
+class _TeleopWebHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass  # Suppress request logging
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+
+    def do_GET(self):
+        global _latest_preview_jpeg, _web_stream_active
+        if self.path in ("/", "/index.html"):
+            html = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Franka Teleop Recording Live Stream</title>
+    <style>
+        body {
+            margin: 0;
+            background: #0d1117;
+            color: #c9d1d9;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .header {
+            margin: 12px 0 8px 0;
+            font-size: 20px;
+            font-weight: 600;
+            color: #58a6ff;
+            letter-spacing: 0.5px;
+        }
+        .stream-box {
+            position: relative;
+            max-width: 98vw;
+            border: 2px solid #30363d;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.6);
+            background: #161b22;
+        }
+        img {
+            display: block;
+            width: 100%;
+            height: auto;
+            max-height: 82vh;
+        }
+        .instructions {
+            margin-top: 10px;
+            font-size: 13px;
+            color: #8b949e;
+        }
+        .badge {
+            background: #21262d;
+            border: 1px solid #30363d;
+            padding: 2px 8px;
+            border-radius: 4px;
+            color: #f0883e;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">Franka Panda &bull; LeRobot Teleop Live Monitor</div>
+    <div class="stream-box">
+        <img src="/stream.mjpg" alt="Franka Teleop Camera Stream">
+    </div>
+    <div class="instructions">
+        Franka Keybinds: <span class="badge">'s'=Start REC</span> <span class="badge">'e'=Save</span> <span class="badge">'d'=Discard</span> <span class="badge">'q'=Quit</span>
+    </div>
+</body>
+</html>"""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html.encode("utf-8"))))
+            self.end_headers()
+            self.wfile.write(html.encode("utf-8"))
+        elif self.path == "/stream.mjpg":
+            self.send_response(200)
+            self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+            self.send_header("Cache-Control", "no-cache, private")
+            self.send_header("Pragma", "no-cache")
+            self.end_headers()
+            while _web_stream_active:
+                with _preview_lock:
+                    frame_bytes = _latest_preview_jpeg
+                if frame_bytes is not None:
+                    try:
+                        self.wfile.write(b"--frame\r\n")
+                        self.send_header("Content-Type", "image/jpeg")
+                        self.send_header("Content-Length", str(len(frame_bytes)))
+                        self.end_headers()
+                        self.wfile.write(frame_bytes)
+                        self.wfile.write(b"\r\n")
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                time.sleep(0.04)
+
+
+class _ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
+def _start_teleop_web_server(port: int = 8080) -> tuple[Any, int]:
+    global _web_stream_active
+    _web_stream_active = True
+    for p in [port, port + 1, 8088, 8090]:
+        try:
+            server = _ThreadedHTTPServer(("0.0.0.0", p), _TeleopWebHandler)
+            t = threading.Thread(target=server.serve_forever, name="teleop-web-stream", daemon=True)
+            t.start()
+            return server, p
+        except OSError:
+            continue
+    return None, 0
+
+
+def _draw_recording_dashboard(
+    front_bgr: np.ndarray,
+    wrist_bgr: np.ndarray,
+    *,
+    recording: bool,
+    active_episode_id: int | None,
+    episode_frames: int,
+    fps: float,
+    target_fps: int,
+    task: str,
+    total_episodes: int,
+    last_status: tuple[str, str, float] | None,
+    teleop_enabled: bool,
+    gripper_open: bool | None,
+    front_serial: str,
+    wrist_serial: str,
+) -> np.ndarray:
+    import cv2
+    h, w = front_bgr.shape[:2]
+    now = time.time()
+
+    # 1. Front Camera View
+    f = front_bgr.copy()
+    cv2.rectangle(f, (0, 0), (w, 32), (15, 15, 15), -1)
+    cv2.putText(f, f"FRONT CAMERA ({front_serial})", (10, 22), cv2.FONT_HERSHEY_DUPLEX, 0.52, (50, 205, 50), 1, cv2.LINE_AA)
+    cv2.putText(f, f"{fps:.1f} FPS", (w - 85, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (200, 200, 200), 1, cv2.LINE_AA)
+    cx, cy = w // 2, h // 2
+    cv2.line(f, (cx - 15, cy), (cx + 15, cy), (0, 255, 255), 1)
+    cv2.line(f, (cx, cy - 15), (cx, cy + 15), (0, 255, 255), 1)
+
+    # 2. Wrist Camera View
+    wr = wrist_bgr.copy()
+    cv2.rectangle(wr, (0, 0), (w, 32), (15, 15, 15), -1)
+    cv2.putText(wr, f"WRIST CAMERA ({wrist_serial})", (10, 22), cv2.FONT_HERSHEY_DUPLEX, 0.52, (255, 191, 0), 1, cv2.LINE_AA)
+    grip_str = "GRIPPER: OPEN" if gripper_open else ("GRIPPER: CLOSED" if gripper_open is False else "GRIPPER: --")
+    grip_color = (0, 255, 0) if gripper_open else (0, 165, 255)
+    cv2.putText(wr, grip_str, (w - 170, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.46, grip_color, 1, cv2.LINE_AA)
+    cv2.line(wr, (cx - 15, cy), (cx + 15, cy), (0, 255, 255), 1)
+    cv2.line(wr, (cx, cy - 15), (cx, cy + 15), (0, 255, 255), 1)
+
+    combined = np.hstack([f, wr])
+    cw_total = 2 * w
+
+    # 3. Mega Top Status Banner (height: 42px)
+    top_banner = np.zeros((42, cw_total, 3), dtype=np.uint8)
+    if recording:
+        blink = int(now * 2) % 2 == 0
+        bg_color = (0, 0, 180) if blink else (0, 0, 130)
+        top_banner[:] = bg_color
+        rec_text = f" [REC] Episode #{active_episode_id}  |  Frames: {episode_frames} ({episode_frames / max(target_fps, 1):.1f}s)  |  Task: \"{task}\""
+        cv2.putText(top_banner, rec_text, (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(top_banner, "RECORDING ACTIVE", (cw_total - 180, 28), cv2.FONT_HERSHEY_DUPLEX, 0.52, (0, 255, 255), 1, cv2.LINE_AA)
+    elif last_status is not None and (now - last_status[2]) < 3.5:
+        text, kind, _ = last_status
+        if kind == "save":
+            top_banner[:] = (34, 139, 34)  # Forest green
+            cv2.putText(top_banner, f"[SAVED] {text}  |  Total Episodes Saved: {total_episodes}", (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+        else:
+            top_banner[:] = (0, 100, 200)  # Orange for discard
+            cv2.putText(top_banner, f"[DISCARDED] {text}", (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+    else:
+        top_banner[:] = (45, 35, 25)
+        teleop_txt = "TELEOP: ACTIVE" if teleop_enabled else "TELEOP: STANDBY"
+        cv2.putText(top_banner, f"[IDLE / READY] Press 's' on Franka terminal to start REC  |  Next Ep: #{total_episodes}  |  Task: \"{task}\"", (15, 28), cv2.FONT_HERSHEY_DUPLEX, 0.52, (100, 220, 255), 1, cv2.LINE_AA)
+        cv2.putText(top_banner, teleop_txt, (cw_total - 160, 28), cv2.FONT_HERSHEY_DUPLEX, 0.48, (0, 255, 0) if teleop_enabled else (160, 160, 160), 1, cv2.LINE_AA)
+
+    # 4. Bottom Footer Bar (28px high)
+    footer = np.zeros((28, cw_total, 3), dtype=np.uint8)
+    footer[:] = (20, 20, 20)
+    cv2.putText(footer, f"Dataset: Total Episodes = {total_episodes}", (15, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.putText(footer, "Franka Terminal Controls:  's'=Start REC    'e'=Save    'd'=Discard    'q'=Quit", (cw_total - 580, 19), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 180, 50), 1, cv2.LINE_AA)
+
+    return np.vstack([top_banner, combined, footer])
+
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "bridge"))
@@ -456,10 +663,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-skew-ms", type=float, default=100.0, help="maximum camera/telemetry arrival skew")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--streaming-encoding", action="store_true")
-    preview = parser.add_mutually_exclusive_group()
-    preview.add_argument("--preview", dest="no_preview", action="store_false")
-    preview.add_argument("--no-preview", dest="no_preview", action="store_true")
-    parser.set_defaults(no_preview=True)
+    preview_grp = parser.add_mutually_exclusive_group()
+    preview_grp.add_argument("--preview", dest="preview", action="store_true", help="Enable live camera & recording dashboard (default: True)")
+    preview_grp.add_argument("--no-preview", dest="preview", action="store_false", help="Disable live preview (headless mode)")
+    parser.set_defaults(preview=True)
+    parser.add_argument("--no-gui", action="store_true", help="Disable desktop OpenCV window (web stream only)")
+    parser.add_argument("--web-port", type=int, default=8080, help="HTTP Web streaming port (default: 8080, 0 to disable)")
     parser.add_argument("--self-check", action="store_true")
     return parser.parse_args()
 
@@ -550,26 +759,85 @@ def main() -> int:
         episode_valid = False
         pending = None
 
+    actual_web_port = 0
+    if args.preview and args.web_port > 0:
+        _, actual_web_port = _start_teleop_web_server(args.web_port)
+
+    print("\n" + "=" * 80)
+    print("  FRANKA LEROBOT TELEOP RECORDER: LIVE CAMERA & TELEMETRY MONITOR")
+    print("=" * 80)
+    if args.preview:
+        if not args.no_gui:
+            print("[*] Desktop Window: Active (Press 'q' in window or on Franka to quit)")
+        else:
+            print("[*] Desktop Window: Disabled (--no-gui)")
+        if actual_web_port > 0:
+            print(f"[*] Web Dashboard:  http://localhost:{actual_web_port}  (LAN: http://10.70.242.38:{actual_web_port})")
+    else:
+        print("[*] Visual Stream:  Disabled (--no-preview)")
+    print(f"[*] Dataset Root:   {args.root}")
+    print(f"[*] Task:           \"{args.task}\"")
+    print(f"[*] Target Rate:    {args.fps} Hz (Action: {args.action_space})")
+    print("[*] Status:         Waiting for Franka episode events. Control with s/e/d/p/q on Franka.")
+    print("=" * 80 + "\n")
+
+    last_status_event: tuple[str, str, float] | None = None
+    teleop_active = False
+    last_gripper_open: bool | None = None
+    calc_fps = float(args.fps)
+    last_fps_time = time.perf_counter()
+    render_frame_count = 0
+
     try:
         cameras.start()
         client.start()
-        print("Waiting for Franka episode events. Control recording with s/e/d/p/q on the Franka terminal.")
-        import cv2
+        if args.preview:
+            import cv2
 
         while True:
-            message = client.get(timeout_s=0.05)
-            if not args.no_preview:
+            message = client.get(timeout_s=0.03)
+
+            if args.preview:
                 images = cameras.latest_images()
                 if images is not None:
-                    preview = np.hstack(
-                        [
-                            cv2.cvtColor(images["front"], cv2.COLOR_RGB2BGR),
-                            cv2.cvtColor(images["wrist"], cv2.COLOR_RGB2BGR),
-                        ]
+                    now_t = time.perf_counter()
+                    render_frame_count += 1
+                    if now_t - last_fps_time >= 1.0:
+                        calc_fps = render_frame_count / (now_t - last_fps_time)
+                        render_frame_count = 0
+                        last_fps_time = now_t
+
+                    f_bgr = cv2.cvtColor(images["front"], cv2.COLOR_RGB2BGR)
+                    w_bgr = cv2.cvtColor(images["wrist"], cv2.COLOR_RGB2BGR)
+
+                    dashboard = _draw_recording_dashboard(
+                        f_bgr,
+                        w_bgr,
+                        recording=recording,
+                        active_episode_id=active_episode_id,
+                        episode_frames=episode_frames,
+                        fps=calc_fps,
+                        target_fps=args.fps,
+                        task=args.task,
+                        total_episodes=dataset.num_episodes,
+                        last_status=last_status_event,
+                        teleop_enabled=teleop_active,
+                        gripper_open=last_gripper_open,
+                        front_serial=args.front_serial,
+                        wrist_serial=args.wrist_serial,
                     )
-                    cv2.imshow("LeRobot recording: front | wrist (q exits GPU recorder)", preview)
-                    if cv2.waitKey(1) & 0xFF == ord("q"):
-                        break
+
+                    if actual_web_port > 0:
+                        ret, jpeg = cv2.imencode(".jpg", dashboard, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                        if ret:
+                            with _preview_lock:
+                                _latest_preview_jpeg = jpeg.tobytes()
+
+                    if not args.no_gui:
+                        cv2.imshow("Franka LeRobot Teleop Recorder [Live Stream & HUD]", dashboard)
+                        if cv2.waitKey(1) & 0xFF == ord("q"):
+                            break
+
             if message is None:
                 continue
 
@@ -588,6 +856,7 @@ def main() -> int:
                 episode_frames = 0
                 pending = None
                 previous_seq = None
+                last_status_event = None
                 print(f"Episode {active_episode_id} started: task={args.task!r}")
                 continue
             if message_type == "episode_end":
@@ -596,9 +865,11 @@ def main() -> int:
                 if recording and int(message["episode_id"]) == active_episode_id:
                     if message["save"] and episode_valid and episode_frames > 0:
                         dataset.save_episode()
+                        last_status_event = (f"Episode #{active_episode_id} Saved ({episode_frames} frames)", "save", time.time())
                         print(f"Episode {active_episode_id} saved: {episode_frames} frames")
                     else:
                         dataset.clear_episode_buffer()
+                        last_status_event = (f"Episode #{active_episode_id} Discarded", "discard", time.time())
                         print(f"Episode {active_episode_id} discarded")
                 recording = False
                 episode_valid = False
@@ -610,6 +881,11 @@ def main() -> int:
             if int(message["episode_id"]) != active_episode_id or not message["recording"]:
                 abort_episode("episode id/recording flag mismatch")
                 continue
+            teleop_active = bool(message.get("teleop_enabled", True))
+            target_grip_val = message.get("target_gripper")
+            if target_grip_val is not None:
+                last_gripper_open = bool(float(target_grip_val) < 0.5)
+
             if not message["teleop_enabled"]:
                 abort_episode("teleoperation was disabled during recording")
                 continue
@@ -662,7 +938,9 @@ def main() -> int:
                 client.stop()
             finally:
                 dataset.finalize()
-        if not args.no_preview:
+        global _web_stream_active
+        _web_stream_active = False
+        if args.preview and not args.no_gui:
             import cv2
             cv2.destroyAllWindows()
     print(f"Dataset finalized at {args.root}; episodes={dataset.num_episodes}, frames={dataset.num_frames}")
