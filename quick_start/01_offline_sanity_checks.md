@@ -83,20 +83,62 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\test_differentiable_fk.p
 
 ---
 
-## 5. 双摄硬件快速体检与实时查看
+## 5. 双摄实时查看与硬件体检 (Live Camera & Check)
 
-- **快速体检（采样 15 帧核验掉帧与序列号）**：
-  ```cmd
-  cd /d C:\Users\74727\Desktop\project\VLA_franka
-  .\scripts\check_cameras.bat
-  ```
-  *(如需弹出原生 OpenCV 窗口查看：`scripts\check_cameras.bat --gui`)*
+### 5.1 双摄持续实时监控 (`.\scripts\live_camera.bat`)
 
-- **持续实时监控（桌面 30 FPS 窗口 + 局域网 Web 推流）**：
-  ```cmd
-  .\scripts\live_camera.bat
+如需在实验过程中**一直持续查看相机实时画面**（如确认物料摆放、观察手腕视角），直接运行该脚本：
+
+#### 使用方法：
+在工程根目录下（`C:\Users\74727\Desktop\project\VLA_franka`）直接运行：
+
+```powershell
+cd C:\Users\74727\Desktop\project\VLA_franka
+.\scripts\live_camera.bat
+```
+
+#### 支持的双模查看方式：
+程序启动后会**同时开启**以下两种实时查看通道：
+1. **Windows 桌面实时窗口 (OpenCV GUI)**：
+   - 桌面直接弹出独立画面窗口，左右并排显示 **Front 头部相机**（S/N: `254322072252`）与 **Wrist 腕部相机**（S/N: `348122070854`）；
+   - 窗口左上角实时显示 30 FPS 刷新帧率，按 **`q`** 或 **`ESC`** 即可安全退出。
+2. **局域网 / 浏览器实时流 (MJPEG Web Stream)**：
+   - 后台自动拉起轻量 HTTP 流媒体服务，任何设备直接在浏览器打开即可查看：
+     - **本机浏览器**：[http://localhost:8080](http://localhost:8080)
+     - **局域网手机 / 平板 / 其他电脑**：`http://10.70.242.38:8080`
+
+#### 常用可选参数：
+- **纯网页模式 (无 GUI 桌面弹窗)**：
+  适合在 SSH 远程终端下使用，不弹 Windows 窗口，只推流到网页：
+  ```powershell
+  .\scripts\live_camera.bat --no-gui
   ```
-  *(浏览器打开 `http://localhost:8080` 即可实时查看头部与腕部双摄)*
+- **自定义 Web 服务端口** (例如指定 5000 端口)：
+  ```powershell
+  .\scripts\live_camera.bat --port 5000
+  ```
+
+---
+
+### 5.2 硬件快速抽样体检 (`.\scripts\check_cameras.bat`)
+
+快速捕获 15 帧排查设备连通性、掉帧率、RGB/深度数据包及设备序列号是否匹配：
+
+```powershell
+cd C:\Users\74727\Desktop\project\VLA_franka
+.\scripts\check_cameras.bat
+```
+*(如需同时弹出窗口查看快速采样的画面：`.\scripts\check_cameras.bat --gui`)*
+
+---
+
+### 5.3 相机相关脚本对比速查表
+
+| 脚本 | 核心作用 | 交互方式 | 退出方式 |
+| :--- | :--- | :--- | :--- |
+| **`.\scripts\live_camera.bat`** | **双摄持续监控 (日常首选)** | 桌面 OpenCV 窗口 + Web 浏览器 (`:8080`) | 按 `q` / `ESC` |
+| **`.\scripts\align_camera.bat`** | **头部相机 6-DoF 标定复位** | ChArUco 亚像素锁定 + 手机 Web 看板 (`:8088`) | 误差达标后按 `q` |
+| **`.\scripts\check_cameras.bat`** | **硬件设备快速体检** | 采样 15 帧排查掉帧与设备状态 | 跑完自动退出 |
 
 ---
 

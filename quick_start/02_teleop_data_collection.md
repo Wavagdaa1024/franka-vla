@@ -58,6 +58,9 @@ python3 Teleop_dataset_recorder.py --sample-hz 15
 
 ## 4. 终端 3：Windows 服务器，启动录制端
 
+> [!TIP]
+> **前置确认相机画面**：在正式录制前，推荐先执行 `.\scripts\live_camera.bat` 确认头部正面与手腕相机画面均正常对准作业台（按 `q` 即可退出），再启动录制端。
+
 打开 Windows GPU 服务器终端（PowerShell 或 CMD），进入工程根目录：
 
 ```cmd
