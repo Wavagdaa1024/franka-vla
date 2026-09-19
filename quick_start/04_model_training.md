@@ -23,12 +23,12 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
 ### 推荐首选：DFK 笛卡尔空间损失微调 (带垂直向下约束)
 训练出的模型末端姿态极其稳定（倾角误差 $< 0.5^\circ$）：
 ```cmd
-scripts\train_cartesian_lora_gpu0.bat
+.\scripts\train_cartesian_lora_gpu0.bat
 ```
 
 ### 备用方式：纯关节空间损失微调
 ```cmd
-scripts\train_red_cube_lora_gpu0.bat
+.\scripts\train_red_cube_lora_gpu0.bat
 ```
 
 ---
@@ -71,5 +71,5 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe scripts\python\train_pi05_lora
 训练完成后，使用一键工具查询所有产出权重文件的步数、Loss 与参数配置：
 
 ```cmd
-scripts\list_ckpts.bat
+.\scripts\list_ckpts.bat
 ```

@@ -68,7 +68,7 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
 
 #### 推荐方式（一键批处理入口）：
 ```powershell
-scripts\launch_record.bat `
+.\scripts\launch_record.bat `
   --host 10.197.16.43 `
   --port 8766 `
   --action-space droid_joint_delta `
@@ -101,7 +101,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\record_teleo
 ### 4.2 追加录制到已有数据集（后续追加，必须加 `--resume`）
 
 ```powershell
-scripts\launch_record.bat `
+.\scripts\launch_record.bat `
   --host 10.197.16.43 `
   --port 8766 `
   --action-space droid_joint_delta `

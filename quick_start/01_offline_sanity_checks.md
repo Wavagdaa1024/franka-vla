@@ -88,13 +88,13 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\test_differentiable_fk.p
 - **快速体检（采样 15 帧核验掉帧与序列号）**：
   ```cmd
   cd /d C:\Users\74727\Desktop\project\VLA_franka
-  scripts\check_cameras.bat
+  .\scripts\check_cameras.bat
   ```
   *(如需弹出原生 OpenCV 窗口查看：`scripts\check_cameras.bat --gui`)*
 
 - **持续实时监控（桌面 30 FPS 窗口 + 局域网 Web 推流）**：
   ```cmd
-  scripts\live_camera.bat
+  .\scripts\live_camera.bat
   ```
   *(浏览器打开 `http://localhost:8080` 即可实时查看头部与腕部双摄)*
 
@@ -125,5 +125,5 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\shadow_run_pi05.py
 
 ```cmd
 cd /d C:\Users\74727\Desktop\project\VLA_franka
-scripts\run_agent.bat --mock --checkpoint cartesian_1000
+.\scripts\run_agent.bat --mock --checkpoint cartesian_1000
 ```

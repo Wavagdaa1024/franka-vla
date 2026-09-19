@@ -47,18 +47,18 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
 ### 方式 1：推荐首选 —— DFK 端到端直接推理（姿态垂直锁死，Tilt < 0.5°）
 配合 DFK 笛卡尔空间微调模型，无需额外生硬后处理，端到端自主闭环抓取：
 ```cmd
-scripts\run_agent.bat --raw --checkpoint cartesian_1000 --task "pick and place the red cube"
+.\scripts\run_agent.bat --raw --checkpoint cartesian_1000 --task "pick and place the red cube"
 ```
 
 ### 方式 2：开启实时零空间自稳与速度滤波（RTC 模式）
 开启零空间姿态保护与前置速度投影滤波：
 ```cmd
-scripts\run_agent.bat --rtc --checkpoint cartesian_1000 --task "pick and place the red cube"
+.\scripts\run_agent.bat --rtc --checkpoint cartesian_1000 --task "pick and place the red cube"
 ```
 
 ### 方式 3：离线 Mock 自检（不连机械臂与相机，纯测试模型加载与推理通道）
 ```cmd
-scripts\run_agent.bat --mock --checkpoint cartesian_1000
+.\scripts\run_agent.bat --mock --checkpoint cartesian_1000
 ```
 
 ---
