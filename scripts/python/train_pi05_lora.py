@@ -370,7 +370,9 @@ def main():
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="Learning rate for LoRA & projections (default: 1e-4)")
     parser.add_argument("--lang-rank", type=int, default=16, help="LoRA rank for PaliGemma-2B (default: 16)")
     parser.add_argument("--expert-rank", type=int, default=32, help="LoRA rank for Gemma-300M Expert (default: 32)")
-    parser.add_argument("--state-noise", type=float, default=0.008, help="Gaussian noise std added to state (default: 0.008 rad)")
+    parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA layer dropout probability (default: 0.05)")
+    parser.add_argument("--state-noise", type=float, default=0.0, help="Gaussian noise std added to state (default: 0.0 rad)")
+    parser.add_argument("--resume", type=Path, default=None, help="Resume training from an existing LoRA checkpoint (.pt)")
     parser.add_argument("--warmup-steps", type=int, default=200, help="Linear warmup steps (default: 200)")
     parser.add_argument("--log-freq", type=int, default=DEFAULT_LOG_FREQ)
     parser.add_argument("--save-freq", type=int, default=DEFAULT_SAVE_FREQ)
@@ -463,15 +465,26 @@ def main():
     processor = inference.processor
 
     # 3. Inject LoRA adapters
-    print(f"\n[LoRA] Injecting LoRA adapters (Language r={args.lang_rank}, Expert r={args.expert_rank})...")
+    print(f"\n[LoRA] Injecting LoRA adapters (Language r={args.lang_rank}, Expert r={args.expert_rank}, Dropout={args.lora_dropout:.2f})...")
     lang_loras, expert_loras = inject_pi05_lora(
         net,
         lang_rank=args.lang_rank,
         lang_alpha=float(args.lang_rank * 2),
         expert_rank=args.expert_rank,
         expert_alpha=float(args.expert_rank * 2),
+        lora_dropout=args.lora_dropout,
         target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
     )
+
+    # Resume checkpoint if specified
+    start_step = 1
+    if args.resume and args.resume.exists():
+        print(f"\n[Resume] Loading checkpoint from {args.resume}...")
+        ckpt = torch.load(args.resume, map_location="cuda:0", weights_only=False)
+        if "state_dict" in ckpt:
+            load_lora_state_dict(net, ckpt["state_dict"])
+        start_step = ckpt.get("step", 0) + 1
+        print(f"[Resume] Successfully loaded weights! Resuming training from step {start_step} to {args.steps}...")
 
     # Parameter Audit
     trainable_params = [p for p in net.parameters() if p.requires_grad]
@@ -484,7 +497,7 @@ def main():
     print("=" * 85)
     print(f"  PaliGemma LoRAs:      {len(lang_loras)} linear layers ({sum(p.numel() for l in lang_loras.values() for p in [l.lora_A, l.lora_B])/1e6:,.2f} M params)")
     print(f"  Action Expert LoRAs:  {len(expert_loras)} linear layers ({sum(p.numel() for l in expert_loras.values() for p in [l.lora_A, l.lora_B])/1e6:,.2f} M params)")
-    print(f"  Action Projections:   {sum(p.numel() for m in [net.action_in_proj, net.action_out_proj, net.time_mlp_in, net.time_mlp_out] for p in m.parameters())/1e6:,.2f} M params")
+    print(f"  Action Projections:   {sum(p.numel() for m in [net.action_in_proj, net.action_out_proj, net.time_mlp_in, net.time_mlp_out] for p in m.parameters())/1e6:,.2f} M params)")
     print("-" * 85)
     print(f"  [SUMMARY] Trainable params: {trainable_count:,} ({trainable_count/1e6:,.2f} M, {trainable_count/total_count*100:.2f}%)")
     print(f"  [SUMMARY] Frozen params:    {frozen_count:,} ({frozen_count/1e6:,.2f} M, {frozen_count/total_count*100:.2f}%)")
@@ -494,6 +507,11 @@ def main():
     # 4. Optimizer & Scheduler
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=DEFAULT_WEIGHT_DECAY, betas=(0.9, 0.95))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=1e-6)
+
+    if start_step > 1:
+        for _ in range(start_step - 1):
+            scheduler.step()
+        print(f"[Scheduler] Advanced scheduler to step {start_step - 1} (Resumed LR: {scheduler.get_last_lr()[0]:.2e})")
 
     beta_dist = Beta(
         torch.tensor(getattr(net.config, "time_sampling_beta_alpha", 1.5), device="cuda:0"),
@@ -764,7 +782,7 @@ def main():
     grip_errors = []
     t_start = time.perf_counter()
 
-    for step in range(1, args.steps + 1):
+    for step in range(start_step, args.steps + 1):
         optimizer.zero_grad()
         accum_loss = 0.0
         accum_flow = 0.0

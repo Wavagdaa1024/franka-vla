@@ -100,6 +100,7 @@ def inject_lora_into_submodule(
     target_attr_names: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
     rank: int = 16,
     lora_alpha: float = 32.0,
+    lora_dropout: float = 0.0,
     prefix: str = "",
 ) -> Dict[str, LoRALinear]:
     """
@@ -113,6 +114,7 @@ def inject_lora_into_submodule(
                 child,
                 rank=rank,
                 lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
             )
             setattr(module, name, lora_layer)
             injected[full_name] = lora_layer
@@ -123,6 +125,7 @@ def inject_lora_into_submodule(
                     target_attr_names=target_attr_names,
                     rank=rank,
                     lora_alpha=lora_alpha,
+                    lora_dropout=lora_dropout,
                     prefix=full_name,
                 )
             )
@@ -135,6 +138,7 @@ def inject_pi05_lora(
     lang_alpha: float = 32.0,
     expert_rank: int = 32,
     expert_alpha: float = 64.0,
+    lora_dropout: float = 0.0,
     target_modules: Tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj"),
 ) -> Tuple[Dict[str, LoRALinear], Dict[str, LoRALinear]]:
     """
@@ -155,6 +159,7 @@ def inject_pi05_lora(
         target_attr_names=target_modules,
         rank=lang_rank,
         lora_alpha=lang_alpha,
+        lora_dropout=lora_dropout,
         prefix="paligemma.model.language_model",
     )
 
@@ -165,6 +170,7 @@ def inject_pi05_lora(
         target_attr_names=target_modules,
         rank=expert_rank,
         lora_alpha=expert_alpha,
+        lora_dropout=lora_dropout,
         prefix="gemma_expert",
     )
 
