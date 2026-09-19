@@ -76,7 +76,7 @@ python3 Teleop_dataset_recorder.py --sample-hz 15
 ```powershell
 cd C:\Users\74727\Desktop\project\VLA_franka
 
-C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py `
+C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\record_teleop.py `
   --host 10.197.16.43 `
   --port 8766 `
   --action-space droid_joint_delta `
@@ -93,7 +93,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py
 ```powershell
 cd C:\Users\74727\Desktop\project\VLA_franka
 
-C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\record_teleop.py `
+C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\record_teleop.py `
   --host 10.197.16.43 `
   --port 8766 `
   --action-space droid_joint_delta `

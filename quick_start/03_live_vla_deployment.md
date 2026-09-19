@@ -51,7 +51,7 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
 set CUDA_DEVICE_ORDER=PCI_BUS_ID
 set CUDA_VISIBLE_DEVICES=1
 
-C:\Users\74727\miniconda3\envs\lerobot\python.exe franka_teleop\closed_loop_franka.py ^
+C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\closed_loop_franka.py ^
   --profile jointpos ^
   --checkpoint outputs\checkpoints\action_expert_final.pt ^
   --task "pick and place the red cube" ^
