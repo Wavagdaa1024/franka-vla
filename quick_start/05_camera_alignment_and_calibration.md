@@ -35,7 +35,7 @@ roslaunch franka_example_controllers move_to_camera_calib.launch robot_ip:=172.1
 
 ### 第二步：启动对齐与监测程序
 在 Windows 服务器（`win-74727`）上：
-- 双击运行：`scripts\align_camera.bat`；
+- 双击或在终端运行：`scripts\align_camera.bat`；
 - 桌面将弹出高帧率对准窗口，同时局域网网页服务已同步在 `http://10.70.242.38:8088` 运行（手机浏览器打开即可站在三脚架旁实时查看）。
 
 ---
@@ -64,7 +64,7 @@ roslaunch franka_example_controllers move_to_camera_calib.launch robot_ip:=172.1
 
 ## 附：已记录的 Franka 黄金标定姿态
 
-系统在 `baseline_pose.json` 中已自动绑定记录了当前姿态：
+系统在 `tests\camera_alignment\baseline_pose.json` 中已自动绑定记录了当前姿态：
 - **关节角 ($q_{\text{rad}}$)**：
   `[0.0284, 0.7187, 0.0210, -1.7251, -0.0087, 2.4741, 0.8302]`
 - **末端笛卡尔坐标 ($O\_T\_EE$)**：

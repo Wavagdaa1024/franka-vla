@@ -27,43 +27,55 @@ roslaunch franka_example_controllers joint_velocity_example_controller.launch ro
 source /opt/ros/noetic/setup.bash
 cd /home/ssui/project/embodied_midterm/controller_lerobot
 
-# 启动执行服务（监听 8765 端口，开启 Y 轴镜像以匹配前置相机朝向）
-python3 /home/ssui/project/embodied_midterm/controller_lerobot/closed_loop_franka_server.py --sync --sync-steps 10
+# 推荐：启动 RTC (Real-Time Chunking) 连续流式闭环服务 (带桌面 Z>=7.0mm 安全门禁)
+python3 closed_loop_franka_server.py --rtc --z-min 0.0070
 ```
+*(如果是排查测试，亦可使用传统步进模式：`python3 closed_loop_franka_server.py --sync --sync-steps 15`)*
+
 *(终端将打印机械臂当前关节就绪状态，并等待 Windows 端 Agent 建立 TCP 连接)*
 
 ---
 
 ## 第 3 步：在 Windows GPU 服务器启动 VLA 推理 Agent
 
-在 Windows 端打开 CMD 或 PowerShell，运行：
+在 Windows 端打开 CMD 或 PowerShell，进入工程根目录：
 
-### 方式 A（推荐，一键批处理脚本）：
 ```cmd
 cd /d C:\Users\74727\Desktop\project\VLA_franka
-scripts\launch_live_agent.bat --live --task "pick up the blue block and place it in the brown basket"
 ```
 
-### 方式 B（完整命令行方式）：
+### 方式 1：推荐首选 —— DFK 端到端直接推理（姿态垂直锁死，Tilt < 0.5°）
+配合 DFK 笛卡尔空间微调模型，无需额外生硬后处理，端到端自主闭环抓取：
 ```cmd
-cd /d C:\Users\74727\Desktop\project\VLA_franka
-
-set CUDA_DEVICE_ORDER=PCI_BUS_ID
-set CUDA_VISIBLE_DEVICES=1
-
-C:\Users\74727\miniconda3\envs\lerobot\python.exe src\franka_teleop\closed_loop_franka.py ^
-  --profile jointpos ^
-  --checkpoint outputs\checkpoints\action_expert_final.pt ^
-  --task "pick and place the red cube" ^
-  --live
+scripts\run_agent.bat --raw --checkpoint cartesian_1000 --task "pick and place the red cube"
 ```
 
-### 技巧：如何切换模型与任务对比测试？
-- **测试不同微调 checkpoint（如 Step 500 模型）**：
-  ```cmd
-  scripts\launch_live_agent.bat --live --checkpoint outputs\checkpoints\action_expert_step500.pt --task "pick up the blue block and place it in the brown basket"
-  ```
-- **切换抓取目标**：只需修改 `--task` 参数，例如：`--task "pick and place the red cube"`。
+### 方式 2：开启实时零空间自稳与速度滤波（RTC 模式）
+开启零空间姿态保护与前置速度投影滤波：
+```cmd
+scripts\run_agent.bat --rtc --checkpoint cartesian_1000 --task "pick and place the red cube"
+```
+
+### 方式 3：离线 Mock 自检（不连机械臂与相机，纯测试模型加载与推理通道）
+```cmd
+scripts\run_agent.bat --mock --checkpoint cartesian_1000
+```
+
+---
+
+### 💡 常用检查点 (Checkpoints) 别名速查
+
+`--checkpoint` 参数既支持直接传文件路径，也支持传入内置快捷别名：
+
+| 别名 | 对应检查点文件 | 说明 |
+| :--- | :--- | :--- |
+| **`cartesian_1000`** | `outputs/checkpoints/pi05_lora_cartesian_dfk/pi05_lora_multitask_step_1000.pt` | **【推荐】DFK 笛卡尔位姿 LoRA，倾角严控** |
+| `cartesian_1500` | `outputs/checkpoints/pi05_lora_cartesian_dfk/pi05_lora_multitask_step_1500.pt` | DFK 笛卡尔位姿 LoRA Step 1500 |
+| `cartesian_2000` | `outputs/checkpoints/pi05_lora_cartesian_dfk/pi05_lora_multitask_step_2000.pt` | DFK 笛卡尔位姿 LoRA Step 2000 |
+| `red_cube_1500` | `outputs/checkpoints/pi05_lora_red_cube/pi05_lora_multitask_step_1500.pt` | 纯关节空间 LoRA Step 1500 |
+| `multitask_5000` | `outputs/checkpoints/pi05_lora_multitask/pi05_lora_multitask_step_5000.pt` | 多任务基准微调权重 |
+
+> **提示**：可直接运行 `scripts\list_ckpts.bat` 查询当前机器上所有保存的 Checkpoints 清单与指标。
 
 ---
 

@@ -1,52 +1,75 @@
-# 教程 04：LeRobot 官方模型训练与微调 (04_model_training.md)
+# 教程 04：模型训练与微调 (04_model_training.md)
 
-本教程指导如何使用官方原生 `lerobot` 训练脚本，基于本地录制的数据集对 Policy 进行微调训练。
+本教程指导如何使用工程内的微调训练套件，基于录制的 LeRobot 格式轨迹对 Pi0.5 VLA 进行高效 LoRA 微调。
 
 ---
 
 ## 1. 训练核心原则
 
-1. **全面对齐官方生态**：直接调用 `lerobot.scripts.train`，使用标准 Hydra / Draccus 配置，不手写训练循环。
-2. **GPU 1 物理隔离**：严格使用物理卡 1，避免干扰服务器 GPU 0。
-3. **数据集对齐**：输入数据集必须由 `franka_teleop/record_teleop.py` 写入，符合 LeRobotDataset 规范。
+1. **GPU 0 物理隔离**：训练脚本通过 `CUDA_VISIBLE_DEVICES=0` 绑定物理卡 0 独立运行，不占用 GPU 1（保留给实机实时推理使用）。
+2. **DFK 笛卡尔损失 + 倾角约束**：通过可微正向运动学（DFK），在训练阶段直接对末端执行器 3D 位姿和垂直向下方向施加物理几何损失，消除末端滑移与偏斜。
+3. **数据集对齐**：使用 `scripts\launch_record.bat` 录制的标准 LeRobotDataset 轨迹数据集（如 `dataset\teleop_pick_cube_15hz_001`、`002`）。
 
 ---
 
 ## 2. 启动训练
 
-在 Windows GPU 服务器上，运行：
+在 Windows GPU 服务器上进入工程根目录：
 
-### 方式 A（一键批处理）：
 ```cmd
 cd /d C:\Users\74727\Desktop\project\VLA_franka
-scripts\run_lerobot_train.bat dataset_repo_id=local/franka_red_cube policy=act
 ```
 
-### 方式 B（完整命令行）：
+### 推荐首选：DFK 笛卡尔空间损失微调 (带垂直向下约束)
+训练出的模型末端姿态极其稳定（倾角误差 $< 0.5^\circ$）：
 ```cmd
-cd /d C:\Users\74727\Desktop\project\VLA_franka\lerobot
+scripts\train_cartesian_lora_gpu0.bat
+```
 
-set CUDA_DEVICE_ORDER=PCI_BUS_ID
-set CUDA_VISIBLE_DEVICES=1
-
-C:\Users\74727\miniconda3\envs\lerobot\python.exe -m lerobot.scripts.train ^
-  --dataset.repo_id="C:\Users\74727\Desktop\project\VLA_franka\dataset\teleop_pick_cube_15hz_001" ^
-  --policy.type=pi0 ^
-  --output_dir="outputs\train_pi0_run1" ^
-  --batch_size=8 ^
-  --steps=5000
+### 备用方式：纯关节空间损失微调
+```cmd
+scripts\train_red_cube_lora_gpu0.bat
 ```
 
 ---
 
-## 3. 常见参数说明
+## 3. 自定义参数训练 (底层 Python 引擎)
 
-| 参数项 | 说明 | 示例 |
-|---|---|---|
-| `--dataset.repo_id` | 本地数据集路径或 HuggingFace Hub repo id | `dataset/teleop_pick_cube_15hz_001` |
-| `--policy.type` | 策略架构类型（`pi0`, `smolvla`, `act`, `diffusion`） | `pi0` |
-| `--batch_size` | 训练批次大小（RTX 5090 推荐 8~16） | `8` |
-| `--steps` | 总训练迭代步数 | `5000` |
-| `--output_dir` | 权重检查点保存位置 | `outputs/checkpoints/...` |
-| `--save_freq` | 检查点保存频率（步） | `500` |
-| `--wandb.enable` | 是否开启 W&B 实验在线追踪 | `true` |
+底层 Python 脚本位于 `scripts\python\train_pi05_lora.py`，支持高度灵活的自定义传参：
+
+```powershell
+C:\Users\74727\miniconda3\envs\lerobot\python.exe scripts\python\train_pi05_lora.py `
+  --dataset dataset\teleop_pick_cube_15hz_001 dataset\teleop_pick_cube_15hz_002 `
+  --task-filter "red cube" `
+  --output-dir outputs\checkpoints\my_custom_lora `
+  --cartesian-loss-weight 5.0 `
+  --vertical-loss-weight 2.0 `
+  --steps 3000 `
+  --lr 1e-4 `
+  --save-freq 500 `
+  --eval-freq 250
+```
+
+### 常用核心参数说明：
+
+| 参数项 | 默认值 | 作用说明 |
+| :--- | :---: | :--- |
+| `--dataset` | - | 训练数据集路径列表（可同时传入多个数据集目录） |
+| `--output-dir` | - | 权重检查点保存目录 |
+| `--cartesian-loss-weight` | `5.0` | DFK 末端执行器 3D 坐标 MSE 损失权重 |
+| `--vertical-loss-weight` | `2.0` | 末端执行器工具 Z 轴垂直向下 `[0, 0, -1]` 约束权重 |
+| `--steps` | `2000` | 训练总迭代步数 |
+| `--save-freq` | `500` | Checkpoint 检查点保存频率（步） |
+| `--eval-freq` | `250` | 离线验证评估频率（步） |
+| `--lang-rank` | `16` | PaliGemma-2B 语言视觉主干 LoRA Rank |
+| `--expert-rank` | `32` | Gemma-300M Action Expert LoRA Rank |
+
+---
+
+## 4. 查询已保存的权重清单
+
+训练完成后，使用一键工具查询所有产出权重文件的步数、Loss 与参数配置：
+
+```cmd
+scripts\list_ckpts.bat
+```
