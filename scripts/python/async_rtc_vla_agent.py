@@ -36,9 +36,12 @@ import pyrealsense2 as rs
 
 # Add project root to sys.path
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent if SCRIPT_DIR.name == "python" else SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from franka_teleop.pi05_engine.runtime import PI05Inference
 from franka_teleop.live_guards import validate_joint_velocity_chunk, validate_joint_position_chunk
@@ -53,25 +56,31 @@ WRIST_SERIAL = "348122070854"
 DEFAULT_TARGET_HOST = "10.197.16.43"
 DEFAULT_TARGET_PORT = 8765
 DEFAULT_TASK = "pick and place the red cube"
-DEFAULT_RED_CUBE_LORA = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt"
-DEFAULT_LORA_CKPT = DEFAULT_RED_CUBE_LORA if DEFAULT_RED_CUBE_LORA.exists() else (
-    PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_multitask" / "pi05_lora_multitask_step_5000.pt"
+DEFAULT_50K_PURE_FLOW = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt"
+DEFAULT_LORA_CKPT = DEFAULT_50K_PURE_FLOW if DEFAULT_50K_PURE_FLOW.exists() else (
+    PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "step_02500.pt"
 )
 
 CKPT_ALIASES = {
+    # Pure 8D Joint Flow Matching (Canonical 50k Training)
+    "pure_flow": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_latest": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_2500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "step_02500.pt",
+    # 7D Cartesian End-Effector Scheme (Archived Ablation)
+    "cartesian_7d": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_2000.pt",
+    "cartesian_7d_2000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_2000.pt",
+    "cartesian_7d_2500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_2500.pt",
+    "cartesian_7d_3000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_3000.pt",
+    "cartesian_7d_1500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_1500.pt",
+    "cartesian_7d_1000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_1000.pt",
+    "cartesian_7d_500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_0500.pt",
+    # Legacy / Baseline
     "red_cube": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt",
     "red_cube_1500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt",
     "red_cube_2000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_2000.pt",
-    "red_cube_1000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1000.pt",
-    "red_cube_500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_0500.pt",
     "cartesian_dfk": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_dfk" / "pi05_lora_multitask_step_2000.pt",
-    "cartesian_2000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_dfk" / "pi05_lora_multitask_step_2000.pt",
-    "cartesian_1500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_dfk" / "pi05_lora_multitask_step_1500.pt",
-    "cartesian_1000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_dfk" / "pi05_lora_multitask_step_1000.pt",
-    "cartesian_500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_dfk" / "pi05_lora_multitask_step_0500.pt",
     "multitask_5000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_multitask" / "pi05_lora_multitask_step_5000.pt",
     "expert_final": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_jointpos_expert" / "action_expert_final.pt",
-    "expert_1500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_jointpos_expert" / "action_expert_step_1500.pt",
     "vision_final": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_vision_tuned" / "action_expert_final.pt",
 }
 
@@ -84,6 +93,7 @@ class DualRealSenseStreamer:
         self.fps = fps
         self.frames = {"front": None, "wrist": None}
         self.timestamps = {"front": 0.0, "wrist": 0.0}
+        self.last_valid_frames = {"front": None, "wrist": None}
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.threads = []
@@ -133,20 +143,26 @@ class DualRealSenseStreamer:
         while time.time() - t0 < 10.0:
             with self.lock:
                 if self.frames["front"] is not None and self.frames["wrist"] is not None:
+                    self.last_valid_frames["front"] = self.frames["front"].copy()
+                    self.last_valid_frames["wrist"] = self.frames["wrist"].copy()
                     print("[Cameras] Dual streams online and verified.")
                     return True
             time.sleep(0.1)
         print("[Cameras Warning] Warmup timeout, continuing with available frames.")
         return False
 
-    def get_frames(self, max_age_s: float = 0.25, max_skew_s: float = 0.1):
+    def get_frames(self, max_age_s: float = 0.5):
+        """Returns the most recent synchronized RGB frames, resilient to transient USB jitter."""
         with self.lock:
             now = time.time()
-            if (self.frames["front"] is None or (now - self.timestamps["front"]) > max_age_s or
-                self.frames["wrist"] is None or (now - self.timestamps["wrist"]) > max_age_s or
-                abs(self.timestamps["front"] - self.timestamps["wrist"]) > max_skew_s):
-                return None, None
-            return self.frames["front"].copy(), self.frames["wrist"].copy()
+            if self.frames["front"] is not None and (now - self.timestamps["front"]) <= max_age_s:
+                self.last_valid_frames["front"] = self.frames["front"]
+            if self.frames["wrist"] is not None and (now - self.timestamps["wrist"]) <= max_age_s:
+                self.last_valid_frames["wrist"] = self.frames["wrist"]
+
+            if self.last_valid_frames["front"] is not None and self.last_valid_frames["wrist"] is not None:
+                return self.last_valid_frames["front"].copy(), self.last_valid_frames["wrist"].copy()
+            return None, None
 
     def stop(self):
         self.stop_event.set()
@@ -200,22 +216,21 @@ def main():
     parser.add_argument("--model-dir", default=None, help="Custom path to base model weights checkpoint directory")
     parser.add_argument("--checkpoint", default=None,
                         help="Path to checkpoint .pt or alias (red_cube, red_cube_2000, multitask_5000, expert_final)")
-    parser.add_argument("--raw", action="store_true", default=False,
-                        help="Raw mode: output pure unconstrained policy actions without artificial nullspace orientation locking")
+    parser.add_argument("--lock-vertical", action="store_true", default=False,
+                        help="Enable artificial 5-DOF IK vertical downward orientation locking (ablation only, default: False)")
+    parser.add_argument("--enable-nullspace", action="store_true", default=False,
+                        help="Enable nullspace gripper orientation stabilization (default: False, executes pure 7-DOF policy trajectory)")
     parser.add_argument("--z-floor", type=float, default=DEFAULT_Z_FLOOR,
                         help=f"Minimum safe table Z height in meters (default: {DEFAULT_Z_FLOOR}m = +7.0mm)")
     parser.add_argument("--kp-rot", type=float, default=5.0,
                         help="Nullspace gripper orientation vertical alignment gain (default: 5.0)")
-    parser.add_argument("--disable-nullspace", action="store_true", default=False,
-                        help="Disable nullspace orientation stabilization (ablation only)")
     parser.add_argument("--flip-lr", action="store_true", default=False,
                         help="Invert Joint 0 (base yaw) for camera perspective matching")
     parser.add_argument("--fps", type=int, default=15, help="Control loop frequency in Hz (default: 15)")
     parser.add_argument("--live", action="store_true", default=True, help="Allow camera/network policy streaming (default: True)")
     args = parser.parse_args()
 
-    if args.raw:
-        args.disable_nullspace = True
+    use_nullspace_lock = args.lock_vertical or args.enable_nullspace
 
     print("=" * 80)
     print("  ASYNC RTC VLA INFERENCE AGENT (STRICT GPU 1 ISOLATION: RTX 5090)")
@@ -224,7 +239,7 @@ def main():
     print(f"[*] Task Instruction:       '{args.task}'")
     print(f"[*] Action Profile:         {args.profile}")
     print(f"[*] Table Floor Limit:      Z >= {args.z_floor * 1000.0:.1f} mm")
-    print(f"[*] Nullspace Stabilizer:   {'DISABLED' if args.disable_nullspace else f'ACTIVE (kp_rot={args.kp_rot})'}")
+    print(f"[*] Nullspace Stabilizer:   {f'ACTIVE (kp_rot={args.kp_rot})' if args.enable_nullspace else 'DISABLED (Pure 7-DOF Trajectory)'}")
     print(f"[*] Invert Joint 0:         {args.flip_lr}")
 
     # 1. Start RealSense Streams
@@ -361,8 +376,8 @@ def main():
                         delta_q[:, 0] = -delta_q[:, 0]
                     q_raw_targets = raw_q[None, :] + delta_q
 
-                    # Apply Nullspace Orientation Stabilization & Hard Floor Guard
-                    if not args.disable_nullspace:
+                    # Apply Nullspace Orientation Stabilization & Hard Floor Guard (if explicitly requested)
+                    if use_nullspace_lock:
                         q_processed, max_tilt_deg, z_clamped = correct_chunk_nullspace(
                             current_q=raw_q,
                             chunk_q=q_raw_targets,

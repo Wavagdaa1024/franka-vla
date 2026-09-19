@@ -32,7 +32,7 @@ MYCODE_SRC = PROJECT_ROOT / "src"
 if str(MYCODE_SRC) not in sys.path:
     sys.path.insert(0, str(MYCODE_SRC))
 
-from midterm_robot.vla.pi05.runtime import PI05Inference
+from franka_teleop.pi05_engine.runtime import PI05Inference
 
 REPO_ROOT = PROJECT_ROOT
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints" / "pi05_droid_jointpos"

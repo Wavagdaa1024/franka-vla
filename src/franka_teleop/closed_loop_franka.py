@@ -411,23 +411,6 @@ def run_rtc_loop(arm, conn, args):
                 q_des = np.array(pos_targets[step_in_chunk], dtype=np.float64)
                 pos_err = q_des - curr_q
                 dq_target = args.kp_pos * pos_err
-
-                # Real-time closed-loop vertical orientation locking in position nullspace
-                z_live = forward_kinematics(curr_q)[:3, 2]
-                w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
-                if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
-                    J = analytical_jacobian(curr_q)
-                    J_v = J[:3, :]
-                    J_w = J[3:, :]
-                    J_v_pinv = damped_pinv(J_v, damping=1e-4)
-                    N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
-                    J_w_null = J_w @ N_v
-                    J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
-                    dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
-                    dq_orient_norm = np.linalg.norm(dq_orient)
-                    if dq_orient_norm > 0.15:
-                        dq_orient = dq_orient * (0.15 / dq_orient_norm)
-                    dq_target += dq_orient
             else:
                 dq_target = np.array(vel_targets[step_in_chunk], dtype=np.float64)
 
@@ -584,23 +567,6 @@ def run_sync_loop(arm, conn, args):
                     q_des = np.array(pos_targets[step], dtype=np.float64)
                     pos_err = q_des - curr_q_live
                     dq_target = args.kp_pos * pos_err
-
-                    # Real-time closed-loop vertical orientation locking in position nullspace
-                    z_live = forward_kinematics(curr_q_live)[:3, 2]
-                    w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
-                    if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
-                        J = analytical_jacobian(curr_q_live)
-                        J_v = J[:3, :]
-                        J_w = J[3:, :]
-                        J_v_pinv = damped_pinv(J_v, damping=1e-4)
-                        N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
-                        J_w_null = J_w @ N_v
-                        J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
-                        dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
-                        dq_orient_norm = np.linalg.norm(dq_orient)
-                        if dq_orient_norm > 0.15:
-                            dq_orient = dq_orient * (0.15 / dq_orient_norm)
-                        dq_target += dq_orient
                 else:
                     dq_target = np.array(vels[step], dtype=np.float64)
 
@@ -706,6 +672,8 @@ def main():
                         help=f"Minimum safe table Z height in meters (default: {DEFAULT_Z_FLOOR}m = +7.0mm)")
     parser.add_argument("--kp-pos", type=float, default=8.0,
                         help="P-servo tracking gain for joint position mode (default: 8.0)")
+    parser.add_argument("--lock-vertical", action="store_true", default=False,
+                        help="Enable artificial vertical downward orientation locking (ablation only, default: False, executes true 7-DOF learned trajectory)")
     parser.add_argument("--gripper-open-width", type=float, default=DEFAULT_GRIPPER_OPEN_WIDTH,
                         help=f"Gripper opening width in meters (default: {DEFAULT_GRIPPER_OPEN_WIDTH}m = 70mm, prevents 80mm endstop overflow)")
     parser.add_argument("--close-delay-steps", type=int, default=2,

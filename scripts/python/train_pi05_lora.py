@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Pi0.5 Franka Multi-Task LoRA Fine-Tuning Pipeline.
-Implements Northwestern University IDEAS Lab methodology with dual ablation modes:
-  1. [pure_flow]    : Pure 8D joint-space Flow Matching Loss (OpenPI Baseline).
-  2. [cartesian_7d] : Forward-inferred 7D End-Effector action MSE Loss ([dx, dy, dz, drx, dry, drz, gripper]).
+Pi0.5 Franka Clean Pure Joint Flow Matching LoRA Fine-Tuning Pipeline.
 
-Features:
-  - Episode-level train/test split: strictly isolates held-out episodes for validation (zero temporal leakage).
-  - Weights & Biases (wandb) integration: real-time logging of train flow loss, physical errors, LR, and held-out validation metrics.
-  - Multi-sample held-out validation evaluation during training.
-  - Periodic checkpointing every N steps (step_05000.pt, step_10000.pt, ... step_50000.pt + latest.pt).
+Architecture & Formulation:
+  - Base Model: Pi0.5 DROID JointPos (100% frozen, ~4.14B params).
+  - Language Model (PaliGemma-2B): LoRA rank 16, alpha 32 on attention projections (q, k, v, o) with Dropout.
+  - Action Expert (Gemma-300M): LoRA rank 32, alpha 64 on attention projections (q, k, v, o) with Dropout.
+  - Action Space: Pure 8D joint-space relative displacement (7-DOF delta_q + 1-DOF binary gripper).
+  - Loss Objective: Pure Continuous Flow Matching MSE: ||v_theta(x_t, t) - v_target||^2.
+  - Zero state noise, zero artificial trajectory distortion.
+  - Episode-level held-out validation set evaluation (10-step ODE Euler solver) on eval intervals.
 
 Hardware:
   - Enforced physical GPU 1 (RTX 5090 32GB, CUDA_VISIBLE_DEVICES=1).
@@ -45,9 +45,12 @@ from torch.distributions.beta import Beta
 
 # Add project root to sys.path
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent
+PROJECT_ROOT = SCRIPT_DIR.parent.parent if SCRIPT_DIR.name == "python" else SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from franka_teleop.pi05_engine.runtime import PI05Inference
 from franka_teleop.pi05_engine.lora import (
@@ -77,7 +80,7 @@ DEFAULT_STEPS = 50000
 DEFAULT_LR = 1e-4
 DEFAULT_WEIGHT_DECAY = 0.01
 DEFAULT_LOG_FREQ = 25
-DEFAULT_SAVE_FREQ = 5000
+DEFAULT_SAVE_FREQ = 2500
 DEFAULT_EVAL_FREQ = 2500
 SEED = 42
 
@@ -115,7 +118,6 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
 
         print(f"[Dataset {ds_idx+1}/{len(dataset_dirs)}] Loading demonstrations from {dataset_dir.name}...")
 
-        # Load episode-level tasks mapping from meta/episodes/**/*.parquet
         ep_tasks_map = {}
         episodes_meta_dir = dataset_dir / "meta" / "episodes"
         if episodes_meta_dir.is_dir():
@@ -132,7 +134,6 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
                 except Exception as e:
                     print(f"  [Warning] Reading {ep_pq.name}: {e}")
 
-        # Fallback to tasks.parquet if available
         tasks_file = dataset_dir / "meta" / "tasks.parquet"
         task_map = {}
         if tasks_file.is_file():
@@ -186,12 +187,10 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
                 "length": len(states_raw)
             }
 
-            # Group indices by episode
             ep_boundaries = defaultdict(list)
             for idx, ep in enumerate(ep_indices):
                 ep_boundaries[ep].append(idx)
 
-            # Sample valid chunks
             added = 0
             for ep, indices in ep_boundaries.items():
                 task_str = ep_tasks_map.get(int(ep), task_map.get(task_indices[indices[0]], "pick and place the red cube"))
@@ -231,21 +230,19 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
     train_samples = [s for s in raw_samples if s["global_ep_id"] not in val_ep_set]
     val_samples = [s for s in raw_samples if s["global_ep_id"] in val_ep_set]
 
-    # Index training chunks by task for balanced sampling
     train_task_buckets = defaultdict(list)
     for idx, s in enumerate(train_samples):
         train_task_buckets[s["task"]].append(idx)
 
-    # Index validation chunks by task
     val_task_buckets = defaultdict(list)
     for idx, s in enumerate(val_samples):
         val_task_buckets[s["task"]].append(idx)
 
-    print(f"\n" + "=" * 85)
-    print(f"  DATASET PARTITION & LEAKAGE AUDIT")
-    print(f"=" * 85)
+    print("\n" + "=" * 85)
+    print("  DATASET PARTITION & LEAKAGE AUDIT")
+    print("=" * 85)
     print(f"  Total Demonstrations Loaded: {len(raw_samples):,} chunks across {len(all_episodes)} episodes ({time.perf_counter()-t0:.2f}s)")
-    print(f"  Partition Strategy:          Strict Episode-Level Isolation (0 temporal leakage)")
+    print("  Partition Strategy:          Strict Episode-Level Isolation (0 temporal leakage)")
     print(f"  * Train Set:                 {len(train_samples):,} chunks ({len(train_samples)/len(raw_samples)*100:.1f}%) across {len(all_episodes)-len(val_ep_set)} episodes")
     print(f"  * Held-Out Validation Set:   {len(val_samples):,} chunks ({len(val_samples)/len(raw_samples)*100:.1f}%) across {len(val_ep_set)} episodes")
     print(f"  * Held-Out Episode IDs:      {sorted(list(val_ep_set))}")
@@ -259,7 +256,10 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
 
 
 def evaluate_sample(inference, s, cached_files, dfk=None):
-    """Evaluates a single sample and computes detailed joint & Cartesian metrics."""
+    """
+    Evaluates a single sample using the full multi-step ODE Euler solver.
+    Computes true open-loop joint MAE, action MSE, and physical end-effector errors.
+    """
     cf = cached_files[s["file_key"]]
     f_idx = s["frame_idx"]
     f_img = cf["front_frames"][f_idx]
@@ -277,7 +277,7 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
     obs = {
         "observation.images.base_0_rgb": front_t,
         "observation.images.left_wrist_0_rgb": wrist_t,
-        "observation.state": curr_state
+        "observation.state": curr_state,
     }
     with torch.no_grad():
         pred_chunk = inference.predict_action_chunk(obs, s["task"]).cpu().numpy()[0]
@@ -294,9 +294,10 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
     ee_pos_err_mm = None
     ee_rot_err_deg = None
     if dfk is not None:
-        curr_q_t = torch.from_numpy(curr_q[None, :]).unsqueeze(1).float().to("cuda:0" if torch.cuda.is_available() else "cpu")
-        pred_delta_q_t = torch.from_numpy(pred_chunk[None, :, :7]).float().to("cuda:0" if torch.cuda.is_available() else "cpu")
-        gt_delta_q_t = torch.from_numpy(gt_delta_q[None, :, :7]).float().to("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = "cuda:0" if torch.cuda.is_available() else "cpu"
+        curr_q_t = torch.from_numpy(curr_q[None, :]).unsqueeze(1).float().to(device)
+        pred_delta_q_t = torch.from_numpy(pred_chunk[None, :, :7]).float().to(device)
+        gt_delta_q_t = torch.from_numpy(gt_delta_q[None, :, :7]).float().to(device)
 
         with torch.no_grad():
             pred_ee_6d = dfk.compute_relative_ee_action(curr_q_t, pred_delta_q_t)
@@ -323,7 +324,7 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
 def evaluate_validation_set(inference, val_samples, cached_files, dfk=None, max_samples=25):
     """
     Evaluates a representative subset of held-out validation samples.
-    Returns aggregated metrics for logging and generalization tracking.
+    Returns aggregated metrics for generalization tracking.
     """
     if not val_samples:
         return {}
@@ -359,9 +360,7 @@ def evaluate_validation_set(inference, val_samples, cached_files, dfk=None, max_
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-Task LoRA Fine-Tuning for Pi0.5 Franka.")
-    parser.add_argument("--loss-mode", type=str, choices=("pure_flow", "cartesian_7d"), default="pure_flow",
-                        help="Loss objective: 'pure_flow' (8D Joint Flow Matching Loss) or 'cartesian_7d' (DFK 7D EE Action MSE Loss)")
+    parser = argparse.ArgumentParser(description="Clean Pure Joint Flow Matching LoRA Fine-Tuning for Pi0.5 Franka.")
     parser.add_argument("--dataset", type=Path, nargs="+", default=DEFAULT_DATASET_DIRS, help="Path(s) to dataset(s)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_CKPT_DIR, help="Directory to save LoRA checkpoints")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
@@ -371,7 +370,6 @@ def main():
     parser.add_argument("--lang-rank", type=int, default=16, help="LoRA rank for PaliGemma-2B (default: 16)")
     parser.add_argument("--expert-rank", type=int, default=32, help="LoRA rank for Gemma-300M Expert (default: 32)")
     parser.add_argument("--lora-dropout", type=float, default=0.05, help="LoRA layer dropout probability (default: 0.05)")
-    parser.add_argument("--state-noise", type=float, default=0.0, help="Gaussian noise std added to state (default: 0.0 rad)")
     parser.add_argument("--resume", type=Path, default=None, help="Resume training from an existing LoRA checkpoint (.pt)")
     parser.add_argument("--warmup-steps", type=int, default=200, help="Linear warmup steps (default: 200)")
     parser.add_argument("--log-freq", type=int, default=DEFAULT_LOG_FREQ)
@@ -379,35 +377,32 @@ def main():
     parser.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ)
     parser.add_argument("--task-filter", type=str, default=None, help="Filter dataset by task substring (e.g. 'red cube')")
     parser.add_argument("--preflight-only", action="store_true", help="Run empirical benchmark and exit")
-    # Validation & WandB options
     parser.add_argument("--val-ratio", type=float, default=0.15, help="Ratio of episodes held out for test/validation (default: 0.15)")
     parser.add_argument("--val-seed", type=int, default=42, help="Random seed for train/val episode split (default: 42)")
     parser.add_argument("--num-val-samples", type=int, default=25, help="Number of held-out test chunks evaluated on eval steps (default: 25)")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases real-time tracking")
     parser.add_argument("--wandb-project", type=str, default="pi05-franka-vla", help="W&B project name")
     parser.add_argument("--wandb-name", type=str, default=None, help="W&B run display name")
-    parser.add_argument("--wandb-mode", type=str, choices=("online", "offline", "disabled"), default="offline", help="W&B mode (default: offline)")
+    parser.add_argument("--loss-mode", type=str, default="pure_flow", help="Legacy compatibility flag (always 'pure_flow')")
+    parser.add_argument("--state-noise", type=float, default=0.0, help="Legacy compatibility flag (state noise is strictly disabled 0.0)")
+    parser.add_argument("--wandb-mode", type=str, choices=("online", "offline", "disabled"), default="online", help="W&B mode (default: online)")
     args = parser.parse_args()
 
-    # Automatically align default output directory if not explicitly overridden
-    if args.output_dir == DEFAULT_OUTPUT_CKPT_DIR and args.loss_mode == "cartesian_7d":
-        args.output_dir = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d"
-
     print("=" * 85)
-    print("  PI0.5 MULTI-TASK LoRA FINE-TUNING PIPELINE (NORTHWESTERN IDEAS LAB ROUTE)")
+    print("  PI0.5 CLEAN PURE JOINT FLOW MATCHING LORA PIPELINE")
     print("=" * 85)
-    print(f"[*] Loss Mode:       [{args.loss_mode.upper()}] {'(Pure 8D Joint Flow Matching Loss)' if args.loss_mode == 'pure_flow' else '(DFK 7D EE Action MSE Loss [dx,dy,dz,drx,dry,drz,grip])'}")
-    print(f"[*] Datasets ({len(args.dataset)}):")
+    print("[*] Loss Mode:       [PURE_FLOW] 100% Native OpenPI Joint Flow Matching Loss")
+    print("[*] Datasets ({}):".format(len(args.dataset)))
     for d in args.dataset:
         print(f"      - {d}")
     print(f"[*] Output Dir:      {args.output_dir}")
     print(f"[*] Steps:           {args.steps:,} (Warmup: {args.warmup_steps}, SaveFreq: {args.save_freq:,}, EvalFreq: {args.eval_freq:,})")
     print(f"[*] Batch Size:      {args.batch_size} (Grad Accum: {args.grad_accum}, Effective Batch: {args.batch_size*args.grad_accum})")
     print(f"[*] Learning Rate:   {args.lr:.2e}")
-    print(f"[*] PaliGemma LoRA:  Rank={args.lang_rank}, Alpha={args.lang_rank*2} (Attention projections)")
-    print(f"[*] Action Expert:   Rank={args.expert_rank}, Alpha={args.expert_rank*2} (Attention projections)")
+    print(f"[*] PaliGemma LoRA:  Rank={args.lang_rank}, Alpha={args.lang_rank*2}, Dropout={args.lora_dropout}")
+    print(f"[*] Action Expert:   Rank={args.expert_rank}, Alpha={args.expert_rank*2}, Dropout={args.lora_dropout}")
     print(f"[*] Action Space:    15-step cumulative relative joint displacement a[k] = q[t+k+1] - q[t]")
-    print(f"[*] State Noise:     {args.state_noise:.4f} rad (Anti-Trajectory Memorization)")
+    print(f"[*] State Noise:     DISABLED (Clean Ground Truth Joint Teleop)")
     print(f"[*] Val Partition:   {args.val_ratio*100:.1f}% held-out episodes (seed={args.val_seed}, {args.num_val_samples} eval samples)")
     print(f"[*] W&B Tracking:    {'ENABLED (Mode: ' + args.wandb_mode + ')' if args.wandb else 'DISABLED'}")
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
@@ -427,7 +422,7 @@ def main():
     wandb_run = None
     if args.wandb:
         import wandb
-        run_name = args.wandb_name or f"pi05_{args.loss_mode}_{args.steps // 1000}k"
+        run_name = args.wandb_name or f"pi05_pure_flow_{args.steps // 1000}k"
         try:
             wandb_run = wandb.init(
                 project=args.wandb_project,
@@ -464,7 +459,7 @@ def main():
     net = inference.network
     processor = inference.processor
 
-    # 3. Inject LoRA adapters
+    # 3. Inject LoRA adapters with Dropout
     print(f"\n[LoRA] Injecting LoRA adapters (Language r={args.lang_rank}, Expert r={args.expert_rank}, Dropout={args.lora_dropout:.2f})...")
     lang_loras, expert_loras = inject_pi05_lora(
         net,
@@ -475,16 +470,6 @@ def main():
         lora_dropout=args.lora_dropout,
         target_modules=("q_proj", "k_proj", "v_proj", "o_proj"),
     )
-
-    # Resume checkpoint if specified
-    start_step = 1
-    if args.resume and args.resume.exists():
-        print(f"\n[Resume] Loading checkpoint from {args.resume}...")
-        ckpt = torch.load(args.resume, map_location="cuda:0", weights_only=False)
-        if "state_dict" in ckpt:
-            load_lora_state_dict(net, ckpt["state_dict"])
-        start_step = ckpt.get("step", 0) + 1
-        print(f"[Resume] Successfully loaded weights! Resuming training from step {start_step} to {args.steps}...")
 
     # Parameter Audit
     trainable_params = [p for p in net.parameters() if p.requires_grad]
@@ -504,13 +489,50 @@ def main():
     print(f"  [SUMMARY] Total params:     {total_count:,} ({total_count/1e6:,.2f} M)")
     print("=" * 85)
 
-    # 4. Optimizer & Scheduler
+    # 4. Optimizer & True Linear Warmup + Cosine Annealing Scheduler
+    import math
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=DEFAULT_WEIGHT_DECAY, betas=(0.9, 0.95))
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps, eta_min=1e-6)
 
+    def lr_lambda(current_step: int) -> float:
+        if current_step < args.warmup_steps:
+            return float(current_step + 1) / float(max(1, args.warmup_steps))
+        progress = float(current_step - args.warmup_steps) / float(max(1, args.steps - args.warmup_steps))
+        progress = min(1.0, max(0.0, progress))
+        cos_factor = 0.5 * (1.0 + math.cos(math.pi * progress))
+        min_ratio = 1e-6 / args.lr
+        return max(min_ratio, cos_factor)
+
+    # Resume checkpoint if specified
+    start_step = 1
+    if args.resume and args.resume.exists():
+        print(f"\n[Resume] Loading checkpoint from {args.resume}...")
+        ckpt = torch.load(args.resume, map_location="cuda:0", weights_only=False)
+        if "state_dict" in ckpt:
+            load_lora_state_dict(net, ckpt["state_dict"])
+        start_step = ckpt.get("step", 0) + 1
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                print("[Resume OK] Restored optimizer momentum states.")
+            except Exception as e:
+                print(f"[Resume Note] Fresh optimizer momentum initialized: {e}")
+        print(f"[Resume] Successfully loaded weights! Resuming training from step {start_step} to {args.steps}...")
+
+    for group in optimizer.param_groups:
+        group["initial_lr"] = args.lr
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lr_lambda,
+        last_epoch=(start_step - 1) if start_step > 1 else -1
+    )
     if start_step > 1:
-        for _ in range(start_step - 1):
-            scheduler.step()
+        if args.resume and args.resume.exists() and "scheduler_state_dict" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+                print("[Resume OK] Restored scheduler state.")
+            except Exception:
+                pass
         print(f"[Scheduler] Advanced scheduler to step {start_step - 1} (Resumed LR: {scheduler.get_last_lr()[0]:.2e})")
 
     beta_dist = Beta(
@@ -518,16 +540,33 @@ def main():
         torch.tensor(getattr(net.config, "time_sampling_beta_beta", 1.0), device="cuda:0")
     )
 
-    # Initialize PyTorch Differentiable Kinematics on GPU for physical tracking
-    print("\n[Kinematics] Initializing PyTorch Franka Differentiable Kinematics (DFK) on cuda:0...")
+    # Differentiable Kinematics strictly for periodic validation evaluations
     dfk = FrankaDifferentiableKinematics(device="cuda:0")
 
-    # Balanced batch sampling from training partition
+    # Balanced epoch-shuffled sampling (No chunk starvation, pristine demonstration joints)
+    class TaskBucketSampler:
+        def __init__(self, sample_indices, seed=42):
+            self.sample_indices = list(sample_indices)
+            self.indices = list(sample_indices)
+            self.rng = random.Random(seed)
+            self.rng.shuffle(self.indices)
+            self.ptr = 0
+
+        def next_idx(self):
+            if self.ptr >= len(self.indices):
+                self.rng.shuffle(self.indices)
+                self.ptr = 0
+            idx = self.indices[self.ptr]
+            self.ptr += 1
+            return idx
+
+    task_samplers = {t: TaskBucketSampler(train_task_buckets[t], seed=SEED + i) for i, t in enumerate(task_names)}
+
     def sample_balanced_batch(batch_size):
         sampled = []
         for _ in range(batch_size):
             t_choice = random.choice(task_names)
-            idx_choice = random.choice(train_task_buckets[t_choice])
+            idx_choice = task_samplers[t_choice].next_idx()
             sampled.append(train_samples[idx_choice])
 
         front_list, wrist_list, state_list, action_list, tasks_list = [], [], [], [], []
@@ -537,12 +576,8 @@ def main():
 
             f_img = cf["front_frames"][f_idx]
             w_img = cf["wrist_frames"][f_idx]
-            curr_state = cf["states"][f_idx].copy()
+            curr_state = cf["states"][f_idx]  # Pristine clean state
             curr_q = curr_state[:7]
-
-            # Anti-memorization jitter
-            if args.state_noise > 0:
-                curr_state[:7] += np.random.normal(0, args.state_noise, size=7).astype(np.float32)
 
             future_states = cf["states"][f_idx + 1 : f_idx + 1 + CHUNK_SIZE]
             delta_q = future_states[:, :7] - curr_q[None, :]
@@ -563,6 +598,7 @@ def main():
             tasks_list,
         )
 
+    # Pure Flow Matching Loss computation (Zero per-batch pseudo-Euler DFK overhead)
     def compute_loss(front_t, wrist_t, state_t, action_t, batch_tasks, cur_batch_size):
         obs = {
             "observation.images.base_0_rgb": front_t,
@@ -589,7 +625,7 @@ def main():
         x_t = x_t.to(dtype=proj_dtype)
         v_target = v_target.to(dtype=proj_dtype)
 
-        # Vision Tower is frozen: compute image embeddings without tracking gradients
+        # Frozen Vision Tower: compute image embeddings without gradients
         with torch.no_grad():
             img_embs = []
             pad_masks = []
@@ -601,7 +637,7 @@ def main():
                 pad_masks.append(img_mask[:, None].expand(bsize, num_img_embs))
                 att_masks += [0] * num_img_embs
 
-        # Language tokens: track gradients through PaliGemma LoRA
+        # Language tokens: track gradients through PaliGemma LoRA with Dropout
         lang_emb = net.paligemma_with_expert.embed_language_tokens(prepared.tokens)
         img_embs.append(lang_emb)
         pad_masks.append(prepared.token_mask)
@@ -618,7 +654,7 @@ def main():
         prefix_att_2d_masks_4d = prepare_attention_masks_4d(prefix_att_2d_masks)
         net.paligemma_with_expert.paligemma.model.language_model.config._attn_implementation = "eager"
 
-        # Forward through PaliGemma with LoRA (gradients enabled)
+        # Forward through PaliGemma with LoRA
         _, past_key_values = net.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
             position_ids=prefix_position_ids,
@@ -635,64 +671,21 @@ def main():
             timestep=time_steps.to(dtype=proj_dtype),
         )
 
+        # Mathematically exact Flow Matching Loss on the 8D action space
         flow_loss = F.mse_loss(v_pred[:, :, :8], v_target[:, :, :8])
+        return flow_loss
 
-        # Forward-infer clean action via 1-step ODE integration
-        pred_norm_actions_8d = (noise[:, :, :8] - v_pred[:, :, :8]).float()
-        pred_actions_8d = processor._transform(pred_norm_actions_8d, "action", "ACTION", inverse=True)
-        pred_delta_q = pred_actions_8d[:, :, :7]
-        pred_gripper = pred_actions_8d[:, :, 7:8]
-
-        gt_delta_q = actions_gpu[:, :, :7]
-        gt_gripper = actions_gpu[:, :, 7:8]
-
-        curr_q_tensor = torch.as_tensor(state_t[:, :7], device="cuda:0", dtype=torch.float32).unsqueeze(1)
-
-        pos_err_mm = 0.0
-        rot_err_deg = 0.0
-        grip_err = 0.0
-
-        if args.loss_mode == "pure_flow":
-            total_loss = flow_loss
-            loss_7d = torch.tensor(0.0, device="cuda:0")
-
-            with torch.no_grad():
-                pred_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, pred_delta_q)
-                gt_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, gt_delta_q)
-                pos_err_mm = float(torch.norm(pred_ee_6d[..., :3] - gt_ee_6d[..., :3], dim=-1).mean().item() * 1000.0)
-                rot_err_deg = float(torch.rad2deg(torch.norm(pred_ee_6d[..., 3:6] - gt_ee_6d[..., 3:6], dim=-1)).mean().item())
-                grip_err = float(torch.abs(pred_gripper - gt_gripper).mean().item())
-
-        elif args.loss_mode == "cartesian_7d":
-            pred_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, pred_delta_q)
-            pred_7d = torch.cat([pred_ee_6d, pred_gripper], dim=-1)
-
-            with torch.no_grad():
-                gt_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, gt_delta_q)
-                gt_7d = torch.cat([gt_ee_6d, gt_gripper], dim=-1)
-
-            loss_7d = F.mse_loss(pred_7d, gt_7d)
-            total_loss = loss_7d
-
-            with torch.no_grad():
-                pos_err_mm = float(torch.norm(pred_ee_6d[..., :3] - gt_ee_6d[..., :3], dim=-1).mean().item() * 1000.0)
-                rot_err_deg = float(torch.rad2deg(torch.norm(pred_ee_6d[..., 3:6] - gt_ee_6d[..., 3:6], dim=-1)).mean().item())
-                grip_err = float(torch.abs(pred_gripper - gt_gripper).mean().item())
-
-        return total_loss, flow_loss, loss_7d, pos_err_mm, rot_err_deg, grip_err
-
-    # PREFLIGHT MODE
+    # PREFLIGHT BENCHMARK MODE
     if args.preflight_only:
         print("\n" + "=" * 85)
-        print(f"  EMPIRICAL PREFLIGHT BENCHMARK (Warmup + 5 Trial Steps) [{args.loss_mode.upper()}]")
+        print("  EMPIRICAL PREFLIGHT BENCHMARK (Warmup + 5 Trial Steps)")
         print("=" * 85)
         torch.cuda.reset_peak_memory_stats("cuda:0")
         net.train()
 
-        # Warmup step
         optimizer.zero_grad()
         f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-        w_loss, _, _, _, _, _ = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+        w_loss = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
         w_loss.backward()
         optimizer.step()
         optimizer.zero_grad()
@@ -702,27 +695,16 @@ def main():
         t_bench_start = time.perf_counter()
         for i in range(trial_steps):
             optimizer.zero_grad()
-            step_loss_val = 0.0
             step_flow_val = 0.0
-            step_7d_val = 0.0
-            step_pos_err_val = 0.0
-            step_rot_err_val = 0.0
-            step_grip_err_val = 0.0
             for _ in range(args.grad_accum):
                 f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-                tot_l, f_l, l7d, p_err, r_err, g_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
-                (tot_l / args.grad_accum).backward()
-                step_loss_val += tot_l.item() / args.grad_accum
+                f_l = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+                (f_l / args.grad_accum).backward()
                 step_flow_val += f_l.item() / args.grad_accum
-                step_7d_val += l7d.item() / args.grad_accum
-                step_pos_err_val += p_err / args.grad_accum
-                step_rot_err_val += r_err / args.grad_accum
-                step_grip_err_val += g_err / args.grad_accum
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             torch.cuda.synchronize()
-            loss_detail = f"FlowLoss={step_flow_val:.4f}" if args.loss_mode == "pure_flow" else f"7D-MSE={step_7d_val:.5f}"
-            print(f"    Trial step {i+1}/{trial_steps}: Loss={step_loss_val:.5f} ({loss_detail}) | PosErr={step_pos_err_val:.1f}mm | RotErr={step_rot_err_val:.2f}° | GripErr={step_grip_err_val:.3f}")
+            print(f"    Trial step {i+1}/{trial_steps}: FlowLoss={step_flow_val:.4f}")
         t_bench_end = time.perf_counter()
 
         elapsed_bench = t_bench_end - t_bench_start
@@ -739,12 +721,12 @@ def main():
         print(f"  [*] Step Latency:     {step_time_s*1000:.1f} ms / step ({steps_per_sec:.2f} steps/sec)")
         print(f"  [*] Estimated Time:   {est_total_min:.1f} minutes for {args.steps} steps")
         print("=" * 85)
-        print(f"\n[Preflight Passed] Empirical benchmark passed for [{args.loss_mode.upper()}]. Ready for full execution.")
+        print("\n[Preflight Passed] Clean Pure Flow Matching benchmark passed. Ready for full execution.")
         return 0
 
-    # Initial Baseline Eval on held-out validation set
+    # Baseline Eval on held-out validation set
     print("\n" + "=" * 85)
-    print("  INITIAL ZERO-SHOT EVALUATION (HELD-OUT VALIDATION SET)")
+    print("  INITIAL EVALUATION (HELD-OUT VALIDATION SET, 10-STEP EULER ODE)")
     print("=" * 85)
     net.eval()
     if val_samples:
@@ -765,84 +747,54 @@ def main():
                 "val/gripper_mse": init_val_agg.get("gripper_mse", 0.0),
                 "val/ee_pos_err_mm": init_val_agg.get("ee_pos_err_mm", 0.0),
                 "val/ee_rot_err_deg": init_val_agg.get("ee_rot_err_deg", 0.0),
-            }, step=0)
+            }, step=start_step - 1)
     print("=" * 85)
 
     # 5. Training Loop
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n[Training] Commencing {args.steps:,} steps of multi-task LoRA fine-tuning...")
+    print(f"\n[Training] Commencing multi-task LoRA fine-tuning (Steps {start_step:,} to {args.steps:,})...")
     print(f"[*] Checkpoints will be saved to: {args.output_dir}")
 
     net.train()
-    losses = []
     flow_losses = []
-    l7d_losses = []
-    pos_errors = []
-    rot_errors = []
-    grip_errors = []
     t_start = time.perf_counter()
 
     for step in range(start_step, args.steps + 1):
         optimizer.zero_grad()
-        accum_loss = 0.0
         accum_flow = 0.0
-        accum_7d = 0.0
-        accum_pos_err = 0.0
-        accum_rot_err = 0.0
-        accum_grip_err = 0.0
 
         for _ in range(args.grad_accum):
             f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-            tot_l, f_l, l7d, p_err, r_err, g_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
-            (tot_l / args.grad_accum).backward()
-            accum_loss += tot_l.item() / args.grad_accum
+            f_l = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+            (f_l / args.grad_accum).backward()
             accum_flow += f_l.item() / args.grad_accum
-            accum_7d += l7d.item() / args.grad_accum
-            accum_pos_err += p_err / args.grad_accum
-            accum_rot_err += r_err / args.grad_accum
-            accum_grip_err += g_err / args.grad_accum
 
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
-        losses.append(accum_loss)
         flow_losses.append(accum_flow)
-        l7d_losses.append(accum_7d)
-        pos_errors.append(accum_pos_err)
-        rot_errors.append(accum_rot_err)
-        grip_errors.append(accum_grip_err)
 
         # Periodic train logging
         if step % args.log_freq == 0:
-            avg_loss = np.mean(losses[-args.log_freq:])
             avg_flow = np.mean(flow_losses[-args.log_freq:])
-            avg_7d = np.mean(l7d_losses[-args.log_freq:])
-            avg_pos_err = np.mean(pos_errors[-args.log_freq:])
-            avg_rot_err = np.mean(rot_errors[-args.log_freq:])
-            avg_grip_err = np.mean(grip_errors[-args.log_freq:])
             cur_lr = scheduler.get_last_lr()[0]
             elapsed = time.perf_counter() - t_start
-            steps_per_sec = step / elapsed
-            loss_str = f"FlowLoss: {avg_flow:.4f}" if args.loss_mode == "pure_flow" else f"7D-MSE: {avg_7d:.5f}"
-            print(f"  [Step {step:05d}/{args.steps:05d}] {loss_str} | PosErr: {avg_pos_err:.1f}mm | RotErr: {avg_rot_err:.2f}° | GripErr: {avg_grip_err:.3f} | LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} s/s | Elapsed: {elapsed/60:.1f}m")
+            steps_per_sec = (step - start_step + 1) / max(elapsed, 1e-4)
+            print(f"  [Step {step:05d}/{args.steps:05d}] FlowLoss: {avg_flow:.4f} | LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} s/s | Elapsed: {elapsed/60:.1f}m")
 
             if wandb_run:
                 wandb.log({
-                    "train/loss": avg_loss,
                     "train/flow_loss": avg_flow,
-                    "train/pos_err_mm": avg_pos_err,
-                    "train/rot_err_deg": avg_rot_err,
-                    "train/grip_err": avg_grip_err,
                     "train/lr": cur_lr,
                     "train/speed_sps": steps_per_sec,
                 }, step=step)
 
-        # Held-out validation evaluation
+        # Held-out validation evaluation with 10-step ODE Euler solver
         if step % args.eval_freq == 0 and val_samples:
             net.eval()
             print(f"\n  ===========================================================================")
-            print(f"  >>> HELD-OUT VALIDATION SET EVALUATION @ Step {step:05d} <<<")
+            print(f"  >>> HELD-OUT VALIDATION SET EVALUATION @ Step {step:05d} (10-Step Euler) <<<")
             print(f"  ===========================================================================")
             val_agg = evaluate_validation_set(inference, val_samples, cached_files, dfk=dfk, max_samples=args.num_val_samples)
             print(f"  Samples Evaluated: {val_agg.get('val_samples_count', 0)} from {len(val_ep_set)} held-out episodes")
@@ -874,16 +826,13 @@ def main():
             state_dict = extract_lora_state_dict(net)
             save_payload = {
                 "step": step,
-                "loss_mode": args.loss_mode,
-                "loss": float(np.mean(losses[-50:])),
                 "flow_loss": float(np.mean(flow_losses[-50:])),
-                "cartesian_7d_loss": float(np.mean(l7d_losses[-50:])),
-                "pos_err_mm": float(np.mean(pos_errors[-50:])),
-                "rot_err_deg": float(np.mean(rot_errors[-50:])),
-                "grip_err": float(np.mean(grip_errors[-50:])),
                 "state_dict": state_dict,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "lang_rank": args.lang_rank,
                 "expert_rank": args.expert_rank,
+                "lora_dropout": args.lora_dropout,
                 "args": vars(args),
                 "val_episodes": list(val_ep_set),
                 "timestamp": time.time(),
@@ -899,7 +848,7 @@ def main():
 
     total_time = time.perf_counter() - t_start
     print("\n" + "=" * 85)
-    print(f"  LoRA FINE-TUNING [{args.loss_mode.upper()}] COMPLETED in {total_time/60:.1f} minutes!")
+    print(f"  LoRA FINE-TUNING COMPLETED in {total_time/60:.1f} minutes!")
     print(f"  Checkpoints saved in: {args.output_dir}")
     print("=" * 85)
 

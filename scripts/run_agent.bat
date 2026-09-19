@@ -18,7 +18,7 @@ echo   FRANKA VLA UNIFIED AGENT LAUNCHER (GPU 1, RTX 5090 32GB)
 echo ===============================================================================
 echo   Franka Host:  10.197.16.43:8765
 echo   Action Mode:  jointpos
-echo   Default Ckpt: pi05_lora_red_cube\step_1500 (Pure Red Cube LoRA)
+echo   Default Ckpt: pi05_lora_pure_flow_50k\latest.pt (Canonical 50k Pure Flow)
 echo   Python Env:   %PY%
 echo ===============================================================================
 

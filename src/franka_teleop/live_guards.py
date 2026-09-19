@@ -7,7 +7,8 @@ import numpy as np
 from franka_teleop.kinematics import (
     FRANKA_JOINT_LIMITS,
     DEFAULT_Z_FLOOR,
-    forward_kinematics
+    forward_kinematics,
+    analytical_jacobian
 )
 
 
@@ -62,13 +63,18 @@ def validate_joint_position_chunk(
         clamped_delta = np.clip(delta, -max_step_delta, max_step_delta)
         q[step] = prev + clamped_delta
 
-    # 3. Z floor verification
+    # 3. Real Z-floor table collision guard (lifting penetrated waypoints)
     if z_floor is not None:
         for step in range(q.shape[0]):
             p_ee = forward_kinematics(q[step])[:3, 3]
-            if p_ee[2] < z_floor - 0.002: # Allow 2mm numerical margin
-                # Warning or nudge
-                pass
+            if p_ee[2] < z_floor:
+                dz = float(z_floor - p_ee[2])
+                J = analytical_jacobian(q[step])
+                J_z = J[2, :]
+                dq_lift = J_z * (dz / (np.dot(J_z, J_z) + 1e-4))
+                q[step] += dq_lift
+                for j in range(7):
+                    q[step, j] = np.clip(q[step, j], FRANKA_JOINT_LIMITS[j][0], FRANKA_JOINT_LIMITS[j][1])
 
     # 4. Gripper bounds
     g = np.clip(g, 0.0, 1.0)
