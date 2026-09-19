@@ -28,7 +28,7 @@ source /opt/ros/noetic/setup.bash
 cd /home/ssui/project/embodied_midterm/controller_lerobot
 
 # 启动执行服务（监听 8765 端口，开启 Y 轴镜像以匹配前置相机朝向）
-python3 closed_loop_franka_server.py --port 8765 --invert-y
+python3 /home/ssui/project/embodied_midterm/controller_lerobot/closed_loop_franka_server.py --sync --sync-steps 10
 ```
 *(终端将打印机械臂当前关节就绪状态，并等待 Windows 端 Agent 建立 TCP 连接)*
 

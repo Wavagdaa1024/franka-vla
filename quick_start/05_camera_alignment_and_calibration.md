@@ -6,10 +6,15 @@
 
 ---
 
-## 核心架构与入口
+## 核心架构与入口（相机与机械臂彻底解耦）
 
-- **机械臂就位程序**：`scripts\move_to_camera_calib.bat`
-- **相机复位监控程序**：`scripts\align_camera.bat`
+> [!IMPORTANT]
+> **相机调试与机械臂运动是 100% 物理完全解耦的两个独立模块**：
+> - **相机复位监控**（`scripts\align_camera.bat`）：在 Windows GPU 服务器上运行，为纯视觉、只读的轻量感知工具，内部绝无任何机器人控制代码，调试相机时机械臂绝不会误动。
+> - **机械臂就位**（ROS Launch：`move_to_camera_calib.launch`）：在 Franka 控制电脑上直接通过 ROS Launch 运行，仅在需要机械臂归位到标定姿态时单独调用一次。
+
+- **机械臂就位**：`roslaunch franka_example_controllers move_to_camera_calib.launch robot_ip:=172.16.0.2`（Franka 控制端独立调用）
+- **相机复位监控**：`scripts\align_camera.bat`（Windows 端纯视觉只读）
 - **基准存储文件**：`tests\camera_alignment\baseline_pose.json`
 - **局域网手机/平板 Web 看板**：`http://10.70.242.38:8088`
 
@@ -17,17 +22,14 @@
 
 ## 快速复位操作三步法
 
-### 第一步：让机械臂一键运行到标定位置
-在对准相机前，机械臂必须回到固定的标准检测位姿：
+### 第一步：让机械臂运行到标定位置
+在对准相机前，在 Franka 控制电脑（`franka-control`）终端运行标准 ROS Launch 节点，机械臂将平滑运动至标准标定位姿后自动退出：
 
-- **方式 1（Windows 一键双击，推荐）**：
-  双击运行 `scripts\move_to_camera_calib.bat`，系统将通过 SSH 自动通知 Franka 控制电脑执行就位动作。
-- **方式 2（Franka Linux 终端直接执行）**：
-  ```bash
-  source /opt/ros/noetic/setup.bash
-  source /home/ssui/franka_ros_ws/catkin_ws2/devel/setup.bash
-  roslaunch franka_example_controllers move_to_camera_calib.launch robot_ip:=172.16.0.2
-  ```
+```bash
+source /opt/ros/noetic/setup.bash
+source /home/ssui/franka_ros_ws/catkin_ws2/devel/setup.bash
+roslaunch franka_example_controllers move_to_camera_calib.launch robot_ip:=172.16.0.2
+```
 
 ---
 

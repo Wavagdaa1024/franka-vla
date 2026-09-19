@@ -17,7 +17,7 @@ echo   Python Env:  %PY%
 echo   Front Cam:   Serial 254322072252
 echo   Wrist Cam:   Serial 348122070854
 echo   Resolution:  640x480 @ 30 FPS
-echo   Web Stream:  http://0.0.0.0:5000 (LAN Accessible)
+echo   Web Stream:  http://0.0.0.0:8080 (LAN Accessible)
 echo ===============================================================================
 
 "%PY%" -u scripts\live_camera_stream.py %*

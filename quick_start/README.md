@@ -28,7 +28,8 @@
    - 官方 `train.py` 命令行调用与参数配置
    - GPU 1 物理隔离与显存控制
 
-5. **[05. ????????????????? (05_camera_alignment_and_calibration.md)](05_camera_alignment_and_calibration.md)**
-   - ????????????? (move_to_camera_calib.bat)
-   - 60mm ChArUco ??? 6-DoF ?????? (lign_camera.bat)
-   - ??? Web ???????? HUD ????
+5. **[05. 第三视角相机快速复位与手眼标定指引 (05_camera_alignment_and_calibration.md)](05_camera_alignment_and_calibration.md)**
+   - 机械臂就位与相机复位完全解耦架构说明
+   - Franka ROS Launch 一键运动至标定位姿 (`move_to_camera_calib.launch`)
+   - 60mm ChArUco 棋盘相间板 6-DoF 亚像素姿态追踪与极简 HUD (`align_camera.bat`)
+   - 局域网 Web 看板实时指导与半透明鬼影叠图
