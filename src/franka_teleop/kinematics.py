@@ -366,11 +366,35 @@ try:
     import torch
     import torch.nn as nn
 
+    def rotmat_to_rotvec_torch(R: "torch.Tensor", eps: float = 1e-6) -> "torch.Tensor":
+        """
+        Differentiable SO(3) matrix logarithm converting rotation matrices to rotation vectors (axis-angle).
+        Args:
+            R: Tensor of shape (..., 3, 3)
+        Returns:
+            r: Tensor of shape (..., 3)
+        """
+        tr = (R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2] - 1.0) * 0.5
+        tr_clamped = torch.clamp(tr, -1.0 + eps, 1.0 - eps)
+        theta = torch.acos(tr_clamped)
+        sin_theta = torch.sin(theta).unsqueeze(-1)
+        v = torch.stack([
+            R[..., 2, 1] - R[..., 1, 2],
+            R[..., 0, 2] - R[..., 2, 0],
+            R[..., 1, 0] - R[..., 0, 1],
+        ], dim=-1)
+        scale = torch.where(
+            theta.unsqueeze(-1) < 1e-4,
+            torch.full_like(v, 0.5),
+            (theta.unsqueeze(-1) / (2.0 * sin_theta)).clamp(max=10.0)
+        )
+        return v * scale
+
     class FrankaDifferentiableKinematics(nn.Module):
         """
         Vectorized, fully differentiable Forward Kinematics module for Franka Emika Panda.
-        Computes analytical end-effector position and tool Z-axis orientation
-        from joint positions q via Craig's Modified DH convention with autograd support.
+        Computes analytical end-effector position, tool Z-axis orientation, and
+        6-DoF relative end-effector action [dx, dy, dz, drx, dry, drz] from joint positions q.
         """
         def __init__(self, device: str = "cpu"):
             super().__init__()
@@ -386,14 +410,13 @@ try:
             flange_tool = A8 @ DEFAULT_F_T_EE.astype(np.float32)
             self.register_buffer("flange_tool", torch.from_numpy(flange_tool).to(device=device))
 
-        def forward(self, q: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+        def compute_fk_matrices(self, q: "torch.Tensor") -> "torch.Tensor":
             """
+            Computes full 4x4 homogeneous transformation matrices for input joint positions.
             Args:
                 q: Joint angles tensor of shape (..., 7) in radians.
             Returns:
-                p_ee: Cartesian 3D position of shape (..., 3) in meters.
-                z_ee: Tool Z-axis orientation unit vector of shape (..., 3).
-                      (Downwards tool orientation target: [0, 0, -1]).
+                T: Homogeneous transformation matrices of shape (..., 4, 4).
             """
             orig_shape = q.shape[:-1]
             q_flat = q.reshape(-1, 7)
@@ -422,9 +445,43 @@ try:
 
             flange_tool_expanded = self.flange_tool.to(dtype=dtype, device=device).unsqueeze(0).expand(N, 4, 4)
             T = torch.bmm(T, flange_tool_expanded)
-            p_ee = T[:, :3, 3].reshape(*orig_shape, 3)
-            z_ee = T[:, :3, 2].reshape(*orig_shape, 3)
+            return T.reshape(*orig_shape, 4, 4)
+
+        def forward(self, q: "torch.Tensor") -> Tuple["torch.Tensor", "torch.Tensor"]:
+            """
+            Args:
+                q: Joint angles tensor of shape (..., 7) in radians.
+            Returns:
+                p_ee: Cartesian 3D position of shape (..., 3) in meters.
+                z_ee: Tool Z-axis orientation unit vector of shape (..., 3).
+            """
+            T = self.compute_fk_matrices(q)
+            p_ee = T[..., :3, 3]
+            z_ee = T[..., :3, 2]
             return p_ee, z_ee
+
+        def compute_relative_ee_action(self, curr_q: "torch.Tensor", delta_q: "torch.Tensor") -> "torch.Tensor":
+            """
+            Computes relative 6-DoF end-effector delta action [dx, dy, dz, drx, dry, drz]
+            from current joint positions and joint position deltas.
+            Args:
+                curr_q: Current joint positions of shape (B, 1, 7) or (B, 7)
+                delta_q: Joint position deltas of shape (B, T, 7)
+            Returns:
+                ee_action_6d: Tensor of shape (B, T, 6) containing [dx, dy, dz, drx, dry, drz]
+            """
+            if curr_q.ndim == 2:
+                curr_q = curr_q.unsqueeze(1)
+            q_traj = curr_q + delta_q
+            T_curr = self.compute_fk_matrices(curr_q)
+            T_traj = self.compute_fk_matrices(q_traj)
+
+            delta_pos = T_traj[..., :3, 3] - T_curr[..., :3, 3]
+            R_curr = T_curr[..., :3, :3]
+            R_traj = T_traj[..., :3, :3]
+            R_rel = torch.matmul(R_traj, R_curr.transpose(-1, -2))
+            delta_rotvec = rotmat_to_rotvec_torch(R_rel)
+            return torch.cat([delta_pos, delta_rotvec], dim=-1)
 
 except ImportError:
     class FrankaDifferentiableKinematics:  # type: ignore

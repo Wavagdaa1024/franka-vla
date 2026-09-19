@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 Pi0.5 Franka Multi-Task LoRA Fine-Tuning Pipeline.
-Implements Northwestern University IDEAS Lab methodology for robotic VLA adaptation.
+Implements Northwestern University IDEAS Lab methodology with dual ablation modes:
+  1. [pure_flow]    : Pure 8D joint-space Flow Matching Loss (OpenPI Baseline).
+  2. [cartesian_7d] : Forward-inferred 7D End-Effector action MSE Loss ([dx, dy, dz, drx, dry, drz, gripper]).
 
 Architecture:
   - Base Model: Pi0.5 DROID JointPos (100% frozen, ~4.14B params).
@@ -10,12 +12,6 @@ Architecture:
   - Action Expert (Gemma-300M): LoRA rank 32, alpha 64 on attention projections (q, k, v, o).
   - Action Projections & Time MLP: Full rank trainable.
   - Total Trainable Parameters: ~10.87M (0.26% of model).
-
-Demonstrations:
-  - Multi-task combination across 3 LeRobot datasets (99 episodes, 16,052 chunks, 5 unique tasks).
-  - Balanced multi-task batch sampling.
-  - 15-step cumulative relative joint delta action space.
-  - Anti-memorization state jittering (Gaussian std=0.008 rad).
 
 Hardware:
   - Enforced physical GPU 1 (RTX 5090 32GB, CUDA_VISIBLE_DEVICES=1).
@@ -31,12 +27,12 @@ import random
 from pathlib import Path
 from collections import defaultdict
 
-# GPU Device Configuration (defaults to GPU 0 if not explicitly set)
+# GPU Device Configuration (defaults to GPU 0 inside visible CUDA devices)
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 if "CUDA_VISIBLE_DEVICES" in os.environ:
     os.environ["CUDA_VISIBLE_DEVICES"] = os.environ["CUDA_VISIBLE_DEVICES"].strip()
 else:
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
 
 import numpy as np
@@ -70,20 +66,18 @@ STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_jointpos_norm_stats.js
 TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
 
 DEFAULT_DATASET_DIRS = [
-    REPO_ROOT / "dataset" / "teleop_pick_cube_15hz_001",
     REPO_ROOT / "dataset" / "teleop_pick_cube_15hz_002",
-    REPO_ROOT / "dataset" / "teleop_pick_vegetables_15hz_001",
 ]
-DEFAULT_OUTPUT_CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_multitask"
+DEFAULT_OUTPUT_CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d"
 
 CHUNK_SIZE = 15
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_GRAD_ACCUM = 2  # Effective batch size = 8
-DEFAULT_STEPS = 5000
+DEFAULT_STEPS = 2000
 DEFAULT_LR = 1e-4
 DEFAULT_WEIGHT_DECAY = 0.01
 DEFAULT_LOG_FREQ = 25
-DEFAULT_SAVE_FREQ = 1000
+DEFAULT_SAVE_FREQ = 500
 DEFAULT_EVAL_FREQ = 250
 SEED = 42
 
@@ -115,6 +109,10 @@ def build_multitask_dataset(dataset_dirs, task_filter=None):
     all_samples = []
 
     for ds_idx, dataset_dir in enumerate(dataset_dirs):
+        if not dataset_dir.exists():
+            print(f"[Dataset {ds_idx+1}/{len(dataset_dirs)}] Skipping non-existent path: {dataset_dir.name}")
+            continue
+
         print(f"[Dataset {ds_idx+1}/{len(dataset_dirs)}] Loading demonstrations from {dataset_dir.name}...")
 
         # Load episode-level tasks mapping from meta/episodes/**/*.parquet
@@ -168,7 +166,7 @@ def build_multitask_dataset(dataset_dirs, task_filter=None):
             try:
                 table = pq.read_table(str(cfg["parquet"]))
             except Exception:
-                print(f"  Skipping unfinished/active {dataset_dir.name}/file-{fid:03d}.parquet")
+                print(f"  Skipping unfinalized {dataset_dir.name}/file-{fid:03d}.parquet")
                 continue
 
             print(f"  Loading video & parquet for {dataset_dir.name}/file-{fid:03d}...")
@@ -179,65 +177,66 @@ def build_multitask_dataset(dataset_dirs, task_filter=None):
             ep_indices = np.array(table.column("episode_index").to_pylist(), dtype=np.int32)
             task_indices = np.array(table.column("task_index").to_pylist(), dtype=np.int32)
 
-            states_droid = states_raw.copy()
-            states_droid[:, 7] = np.clip(states_raw[:, 7], 0.0, 1.0)
-
             cached_files[file_key] = {
                 "front_frames": front_frames,
                 "wrist_frames": wrist_frames,
-                "states": states_droid,
-                "ep_indices": ep_indices,
-                "task_indices": task_indices
+                "states": states_raw,
+                "episodes": ep_indices,
+                "task_indices": task_indices,
+                "length": len(states_raw)
             }
 
-            unique_eps, counts = np.unique(ep_indices, return_counts=True)
-            for ep_id, count in zip(unique_eps, counts):
-                start = np.where(ep_indices == ep_id)[0][0]
-                end = start + count - 1
-                valid_len = count - CHUNK_SIZE
-                if valid_len <= 0:
+            # Group indices by episode
+            ep_boundaries = defaultdict(list)
+            for idx, ep in enumerate(ep_indices):
+                ep_boundaries[ep].append(idx)
+
+            # Sample valid chunks
+            added = 0
+            for ep, indices in ep_boundaries.items():
+                task_str = ep_tasks_map.get(int(ep), task_map.get(task_indices[indices[0]], "pick and place the red cube"))
+                if task_filter and task_filter.lower() not in task_str.lower():
                     continue
 
-                task_prompt = ep_tasks_map.get(ep_id)
-                if not task_prompt or task_prompt == "None":
-                    t_idx = task_indices[start]
-                    task_prompt = task_map.get(t_idx, "pick and place the red cube")
-
-                if task_filter and task_filter.lower() not in task_prompt.lower():
+                if len(indices) <= CHUNK_SIZE:
                     continue
 
-                for t in range(start, end - CHUNK_SIZE + 1):
+                for local_i in range(len(indices) - CHUNK_SIZE):
+                    f_idx = indices[local_i]
                     all_samples.append({
-                        "file_id": file_key,
-                        "frame_idx": t,
-                        "task": task_prompt,
-                        "ep_id": ep_id,
-                        "dataset": dataset_dir.name,
+                        "file_key": file_key,
+                        "frame_idx": f_idx,
+                        "task": task_str,
+                        "episode": int(ep)
                     })
+                    added += 1
 
-    if not all_samples:
-        raise ValueError("No valid demonstration samples found across provided datasets!")
+            print(f"    -> Extracted {added:,} chunks for {dataset_dir.name}/file-{fid:03d}")
 
-    print(f"\n[Index Ready] Indexed {len(all_samples)} valid 15-step chunks across {len(dataset_dirs)} dataset(s) in {time.perf_counter()-t0:.2f}s.")
+    # Index by task for balanced sampling
     task_buckets = defaultdict(list)
     for idx, s in enumerate(all_samples):
         task_buckets[s["task"]].append(idx)
 
-    print(f"  Unique Prompts ({len(task_buckets)} total):")
-    for task_name, indices in sorted(task_buckets.items()):
-        print(f"    - '{task_name}': {len(indices)} chunks ({len(indices)/len(all_samples)*100:.1f}%)")
+    print(f"\n[Dataset Summary] Loaded {len(all_samples):,} total chunks across {len(task_buckets)} tasks in {time.perf_counter()-t0:.2f}s:")
+    for t_name, idx_list in task_buckets.items():
+        print(f"  * Task '{t_name}': {len(idx_list):,} chunks ({len(idx_list)/len(all_samples)*100:.1f}%)")
+
+    if len(all_samples) == 0:
+        raise ValueError(f"No valid demonstration chunks found in specified dataset directories!")
 
     return all_samples, cached_files, task_buckets
 
 
 def evaluate_sample(inference, s, cached_files, dfk=None):
-    """Run full 10-step Euler integration inference on a single sample and return physical action metrics."""
-    cf = cached_files[s["file_id"]]
+    """Evaluates a single sample and computes detailed joint & Cartesian metrics."""
+    cf = cached_files[s["file_key"]]
     f_idx = s["frame_idx"]
     f_img = cf["front_frames"][f_idx]
     w_img = cf["wrist_frames"][f_idx]
     curr_state = cf["states"][f_idx]
     curr_q = curr_state[:7]
+
     future_states = cf["states"][f_idx + 1 : f_idx + 1 + CHUNK_SIZE]
     gt_delta_q = future_states[:, :7] - curr_q[None, :]
     gt_gripper = future_states[:, 7:8]
@@ -263,16 +262,17 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
     improve_pct = float((hold_still_mae_rad - joint_mae_rad) / max(hold_still_mae_rad, 1e-6) * 100.0)
 
     ee_pos_err_mm = None
-    ee_tilt_deg = None
+    ee_rot_err_deg = None
     if dfk is not None:
-        pred_q_traj = torch.from_numpy(curr_q[None, :] + pred_chunk[:, :7]).float()
-        gt_q_traj = torch.from_numpy(curr_q[None, :] + gt_delta_q).float()
+        curr_q_t = torch.from_numpy(curr_q[None, :]).unsqueeze(1).float().to("cuda:0" if torch.cuda.is_available() else "cpu")
+        pred_delta_q_t = torch.from_numpy(pred_chunk[None, :, :7]).float().to("cuda:0" if torch.cuda.is_available() else "cpu")
+        gt_delta_q_t = torch.from_numpy(gt_delta_q[None, :, :7]).float().to("cuda:0" if torch.cuda.is_available() else "cpu")
+
         with torch.no_grad():
-            p_pred, z_pred = dfk(pred_q_traj.to("cuda:0" if torch.cuda.is_available() else "cpu"))
-            p_gt, _ = dfk(gt_q_traj.to("cuda:0" if torch.cuda.is_available() else "cpu"))
-            ee_pos_err_mm = float(torch.norm(p_pred - p_gt, dim=-1).mean().item() * 1000.0)
-            z_u = z_pred / torch.norm(z_pred, dim=-1, keepdim=True).clamp(min=1e-6)
-            ee_tilt_deg = float(torch.rad2deg(torch.acos(torch.clamp(-z_u[..., 2], -1.0, 1.0))).mean().item())
+            pred_ee_6d = dfk.compute_relative_ee_action(curr_q_t, pred_delta_q_t)
+            gt_ee_6d = dfk.compute_relative_ee_action(curr_q_t, gt_delta_q_t)
+            ee_pos_err_mm = float(torch.norm(pred_ee_6d[..., :3] - gt_ee_6d[..., :3], dim=-1).mean().item() * 1000.0)
+            ee_rot_err_deg = float(torch.rad2deg(torch.norm(pred_ee_6d[..., 3:6] - gt_ee_6d[..., 3:6], dim=-1)).mean().item())
 
     return {
         "task": s["task"],
@@ -283,7 +283,7 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
         "hold_still_mae_deg": hold_still_mae_deg,
         "improve_pct": improve_pct,
         "ee_pos_err_mm": ee_pos_err_mm,
-        "ee_tilt_deg": ee_tilt_deg,
+        "ee_rot_err_deg": ee_rot_err_deg,
         "pred_chunk": pred_chunk,
         "gt_chunk": gt_action_chunk,
         "frame_idx": f_idx,
@@ -292,11 +292,13 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Multi-Task LoRA Fine-Tuning for Pi0.5 Franka.")
+    parser.add_argument("--loss-mode", type=str, choices=("pure_flow", "cartesian_7d"), default="cartesian_7d",
+                        help="Loss objective: 'pure_flow' (8D Joint Flow Matching Loss) or 'cartesian_7d' (DFK 7D EE Action MSE Loss)")
     parser.add_argument("--dataset", type=Path, nargs="+", default=DEFAULT_DATASET_DIRS, help="Path(s) to dataset(s)")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_CKPT_DIR, help="Directory to save LoRA checkpoints")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--grad-accum", type=int, default=DEFAULT_GRAD_ACCUM, help="Gradient accumulation steps (default: 2)")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Total training steps (default: 5000)")
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Total training steps (default: 2000)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="Learning rate for LoRA & projections (default: 1e-4)")
     parser.add_argument("--lang-rank", type=int, default=16, help="LoRA rank for PaliGemma-2B (default: 16)")
     parser.add_argument("--expert-rank", type=int, default=32, help="LoRA rank for Gemma-300M Expert (default: 32)")
@@ -306,14 +308,17 @@ def main():
     parser.add_argument("--save-freq", type=int, default=DEFAULT_SAVE_FREQ)
     parser.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ)
     parser.add_argument("--task-filter", type=str, default=None, help="Filter dataset by task substring (e.g. 'red cube')")
-    parser.add_argument("--cartesian-loss-weight", type=float, default=5.0, help="Weight for EE 3D position MSE loss (default: 5.0)")
-    parser.add_argument("--vertical-loss-weight", type=float, default=2.0, help="Weight for EE vertical downward orientation loss (default: 2.0)")
     parser.add_argument("--preflight-only", action="store_true", help="Run empirical benchmark and exit")
     args = parser.parse_args()
+
+    # Automatically align default output directory if not explicitly overridden
+    if args.output_dir == DEFAULT_OUTPUT_CKPT_DIR and args.loss_mode == "pure_flow":
+        args.output_dir = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow"
 
     print("=" * 85)
     print("  PI0.5 MULTI-TASK LoRA FINE-TUNING PIPELINE (NORTHWESTERN IDEAS LAB ROUTE)")
     print("=" * 85)
+    print(f"[*] Loss Mode:       [{args.loss_mode.upper()}] {'(Pure 8D Joint Flow Matching Loss)' if args.loss_mode == 'pure_flow' else '(DFK 7D EE Action MSE Loss [dx,dy,dz,drx,dry,drz,grip])'}")
     print(f"[*] Datasets ({len(args.dataset)}):")
     for d in args.dataset:
         print(f"      - {d}")
@@ -323,10 +328,9 @@ def main():
     print(f"[*] Learning Rate:   {args.lr:.2e}")
     print(f"[*] PaliGemma LoRA:  Rank={args.lang_rank}, Alpha={args.lang_rank*2} (Attention projections)")
     print(f"[*] Action Expert:   Rank={args.expert_rank}, Alpha={args.expert_rank*2} (Attention projections)")
-    print(f"[*] DFK Aux Losses:  Cartesian Pos Weight={args.cartesian_loss_weight}, Vertical Z Downward Weight={args.vertical_loss_weight}")
     print(f"[*] Action Space:    15-step cumulative relative joint displacement a[k] = q[t+k+1] - q[t]")
     print(f"[*] State Noise:     {args.state_noise:.4f} rad (Anti-Trajectory Memorization)")
-    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
     print(f"[*] Hardware:        Physical GPU {gpu_id} (RTX 5090 32GB, CUDA_VISIBLE_DEVICES={gpu_id})")
     print("-" * 85)
 
@@ -338,13 +342,12 @@ def main():
     eval_samples = {}
     for t_name in task_names:
         indices = task_buckets[t_name]
-        # Pick a sample around 40% into the episode where action is actively occurring
         chosen_idx = indices[len(indices) // 3]
         eval_samples[t_name] = all_samples[chosen_idx]
         print(f"  [*] Fixed Eval Sample for '{t_name}': Frame {eval_samples[t_name]['frame_idx']}")
 
     # 2. Model initialization
-    print("\n[Model] Initializing Pi0.5 base model on GPU 1...")
+    print(f"\n[Model] Initializing Pi0.5 base model on GPU {gpu_id}...")
     t0 = time.perf_counter()
     inference = PI05Inference.from_checkpoint(
         CHECKPOINT_DIR,
@@ -396,67 +399,61 @@ def main():
         torch.tensor(getattr(net.config, "time_sampling_beta_beta", 1.0), device="cuda:0")
     )
 
-    dfk = None
-    if args.cartesian_loss_weight > 0 or args.vertical_loss_weight > 0:
-        print("\n[Kinematics] Initializing PyTorch Franka Differentiable Kinematics (DFK) on cuda:0...")
-        dfk = FrankaDifferentiableKinematics(device="cuda:0")
+    # Initialize PyTorch Differentiable Kinematics on GPU
+    print("\n[Kinematics] Initializing PyTorch Franka Differentiable Kinematics (DFK) on cuda:0...")
+    dfk = FrankaDifferentiableKinematics(device="cuda:0")
 
+    # Balanced batch sampling
     def sample_balanced_batch(batch_size):
-        """Samples a balanced mixture across all tasks."""
-        batch_indices = []
+        sampled = []
         for _ in range(batch_size):
             t_choice = random.choice(task_names)
             idx_choice = random.choice(task_buckets[t_choice])
-            batch_indices.append(idx_choice)
+            sampled.append(all_samples[idx_choice])
 
-        batch_front = []
-        batch_wrist = []
-        batch_state = []
-        batch_action_chunks = []
-        batch_tasks = []
-
-        for idx in batch_indices:
-            s = all_samples[idx]
-            cf = cached_files[s["file_id"]]
+        front_list, wrist_list, state_list, action_list, tasks_list = [], [], [], [], []
+        for s in sampled:
+            cf = cached_files[s["file_key"]]
             f_idx = s["frame_idx"]
 
             f_img = cf["front_frames"][f_idx]
             w_img = cf["wrist_frames"][f_idx]
-            curr_state = cf["states"][f_idx]
-
+            curr_state = cf["states"][f_idx].copy()
             curr_q = curr_state[:7]
+
+            # Anti-memorization jitter
+            if args.state_noise > 0:
+                curr_state[:7] += np.random.normal(0, args.state_noise, size=7).astype(np.float32)
+
             future_states = cf["states"][f_idx + 1 : f_idx + 1 + CHUNK_SIZE]
             delta_q = future_states[:, :7] - curr_q[None, :]
             gripper = future_states[:, 7:8]
             action_chunk = np.concatenate([delta_q, gripper], axis=1)
 
-            state_obs = curr_state.copy()
-            if args.state_noise > 0:
-                state_obs[:7] += np.random.normal(0.0, args.state_noise, size=7).astype(np.float32)
+            front_list.append(torch.from_numpy(np.transpose(f_img, (2, 0, 1))))
+            wrist_list.append(torch.from_numpy(np.transpose(w_img, (2, 0, 1))))
+            state_list.append(curr_state)
+            action_list.append(action_chunk)
+            tasks_list.append(s["task"])
 
-            batch_front.append(torch.from_numpy(np.transpose(f_img, (2, 0, 1))))
-            batch_wrist.append(torch.from_numpy(np.transpose(w_img, (2, 0, 1))))
-            batch_state.append(state_obs)
-            batch_action_chunks.append(action_chunk)
-            batch_tasks.append(s["task"])
-
-        front_t = torch.stack(batch_front)
-        wrist_t = torch.stack(batch_wrist)
-        state_t = np.stack(batch_state)
-        action_t = np.stack(batch_action_chunks)
-
-        return front_t, wrist_t, state_t, action_t, batch_tasks
+        return (
+            torch.stack(front_list),
+            torch.stack(wrist_list),
+            np.array(state_list, dtype=np.float32),
+            np.array(action_list, dtype=np.float32),
+            tasks_list,
+        )
 
     def compute_loss(front_t, wrist_t, state_t, action_t, batch_tasks, cur_batch_size):
         obs = {
             "observation.images.base_0_rgb": front_t,
             "observation.images.left_wrist_0_rgb": wrist_t,
-            "observation.state": state_t
+            "observation.state": state_t,
         }
         prepared = processor.prepare(obs, batch_tasks, device="cuda:0")
 
         actions_gpu = torch.from_numpy(action_t).to("cuda:0", dtype=torch.float32)
-        norm_actions_8d = processor._transform(actions_gpu, "action", "ACTION", inverse=False)
+        norm_actions_8d = processor._transform(actions_gpu, "action", "ACTION")
 
         target_actions = torch.zeros(cur_batch_size, CHUNK_SIZE, 32, device="cuda:0", dtype=torch.float32)
         target_actions[:, :, :8] = norm_actions_8d
@@ -521,41 +518,57 @@ def main():
 
         flow_loss = F.mse_loss(v_pred[:, :, :8], v_target[:, :, :8])
 
-        cartesian_loss = torch.tensor(0.0, device="cuda:0")
-        vertical_loss = torch.tensor(0.0, device="cuda:0")
+        # Forward-infer clean action via 1-step ODE integration
+        pred_norm_actions_8d = (noise[:, :, :8] - v_pred[:, :, :8]).float()
+        pred_actions_8d = processor._transform(pred_norm_actions_8d, "action", "ACTION", inverse=True)
+        pred_delta_q = pred_actions_8d[:, :, :7]
+        pred_gripper = pred_actions_8d[:, :, 7:8]
+
+        gt_delta_q = actions_gpu[:, :, :7]
+        gt_gripper = actions_gpu[:, :, 7:8]
+
+        curr_q_tensor = torch.as_tensor(state_t[:, :7], device="cuda:0", dtype=torch.float32).unsqueeze(1)
+
         pos_err_mm = 0.0
-        tilt_err_deg = 0.0
+        rot_err_deg = 0.0
+        grip_err = 0.0
 
-        if dfk is not None and (args.cartesian_loss_weight > 0 or args.vertical_loss_weight > 0):
-            pred_norm_actions_8d = (noise[:, :, :8] - v_pred[:, :, :8]).float()
-            pred_actions_8d = processor._transform(pred_norm_actions_8d, "action", "ACTION", inverse=True)
-            pred_delta_q = pred_actions_8d[:, :, :7]
+        if args.loss_mode == "pure_flow":
+            # Mode 1: Pure 8D joint-space Flow Matching Loss (No mixed terms)
+            total_loss = flow_loss
+            loss_7d = torch.tensor(0.0, device="cuda:0")
 
-            curr_q_tensor = torch.as_tensor(state_t[:, :7], device="cuda:0", dtype=torch.float32).unsqueeze(1)
-            pred_q_traj = curr_q_tensor + pred_delta_q
-            pred_p_ee, pred_z_ee = dfk(pred_q_traj)
+            with torch.no_grad():
+                pred_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, pred_delta_q)
+                gt_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, gt_delta_q)
+                pos_err_mm = float(torch.norm(pred_ee_6d[..., :3] - gt_ee_6d[..., :3], dim=-1).mean().item() * 1000.0)
+                rot_err_deg = float(torch.rad2deg(torch.norm(pred_ee_6d[..., 3:6] - gt_ee_6d[..., 3:6], dim=-1)).mean().item())
+                grip_err = float(torch.abs(pred_gripper - gt_gripper).mean().item())
 
-            if args.cartesian_loss_weight > 0:
-                with torch.no_grad():
-                    gt_q_traj = curr_q_tensor + actions_gpu[:, :, :7]
-                    gt_p_ee, _ = dfk(gt_q_traj)
-                cartesian_loss = F.mse_loss(pred_p_ee, gt_p_ee)
-                pos_err_mm = float(torch.norm(pred_p_ee - gt_p_ee, dim=-1).mean().item() * 1000.0)
+        elif args.loss_mode == "cartesian_7d":
+            # Mode 2: Forward-inferred 7D End-Effector Action MSE Loss (No mixed terms)
+            pred_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, pred_delta_q)
+            pred_7d = torch.cat([pred_ee_6d, pred_gripper], dim=-1)
 
-            if args.vertical_loss_weight > 0:
-                target_z = torch.tensor([0.0, 0.0, -1.0], device="cuda:0", dtype=torch.float32).expand_as(pred_z_ee)
-                vertical_loss = F.mse_loss(pred_z_ee, target_z)
-                with torch.no_grad():
-                    z_u = pred_z_ee / torch.norm(pred_z_ee, dim=-1, keepdim=True).clamp(min=1e-6)
-                    tilt_err_deg = float(torch.rad2deg(torch.acos(torch.clamp(-z_u[..., 2], -1.0, 1.0))).mean().item())
+            with torch.no_grad():
+                gt_ee_6d = dfk.compute_relative_ee_action(curr_q_tensor, gt_delta_q)
+                gt_7d = torch.cat([gt_ee_6d, gt_gripper], dim=-1)
 
-        total_loss = flow_loss + args.cartesian_loss_weight * cartesian_loss + args.vertical_loss_weight * vertical_loss
-        return total_loss, flow_loss, cartesian_loss, vertical_loss, pos_err_mm, tilt_err_deg
+            # Single unified 7-dimensional MSE Loss: [dx, dy, dz, drx, dry, drz, gripper]
+            loss_7d = F.mse_loss(pred_7d, gt_7d)
+            total_loss = loss_7d
+
+            with torch.no_grad():
+                pos_err_mm = float(torch.norm(pred_ee_6d[..., :3] - gt_ee_6d[..., :3], dim=-1).mean().item() * 1000.0)
+                rot_err_deg = float(torch.rad2deg(torch.norm(pred_ee_6d[..., 3:6] - gt_ee_6d[..., 3:6], dim=-1)).mean().item())
+                grip_err = float(torch.abs(pred_gripper - gt_gripper).mean().item())
+
+        return total_loss, flow_loss, loss_7d, pos_err_mm, rot_err_deg, grip_err
 
     # PREFLIGHT MODE
     if args.preflight_only:
         print("\n" + "=" * 85)
-        print("  EMPIRICAL PREFLIGHT BENCHMARK (Warmup + 5 Trial Steps)")
+        print(f"  EMPIRICAL PREFLIGHT BENCHMARK (Warmup + 5 Trial Steps) [{args.loss_mode.upper()}]")
         print("=" * 85)
         torch.cuda.reset_peak_memory_stats("cuda:0")
         net.train()
@@ -575,24 +588,25 @@ def main():
             optimizer.zero_grad()
             step_loss_val = 0.0
             step_flow_val = 0.0
-            step_pos_val = 0.0
-            step_vert_val = 0.0
+            step_7d_val = 0.0
             step_pos_err_val = 0.0
-            step_tilt_err_val = 0.0
+            step_rot_err_val = 0.0
+            step_grip_err_val = 0.0
             for _ in range(args.grad_accum):
                 f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-                tot_l, f_l, p_l, v_l, p_err, t_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+                tot_l, f_l, l7d, p_err, r_err, g_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
                 (tot_l / args.grad_accum).backward()
                 step_loss_val += tot_l.item() / args.grad_accum
                 step_flow_val += f_l.item() / args.grad_accum
-                step_pos_val += p_l.item() / args.grad_accum
-                step_vert_val += v_l.item() / args.grad_accum
+                step_7d_val += l7d.item() / args.grad_accum
                 step_pos_err_val += p_err / args.grad_accum
-                step_tilt_err_val += t_err / args.grad_accum
+                step_rot_err_val += r_err / args.grad_accum
+                step_grip_err_val += g_err / args.grad_accum
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
             optimizer.step()
             torch.cuda.synchronize()
-            print(f"    Trial step {i+1}/{trial_steps}: Total Loss={step_loss_val:.4f} (Flow={step_flow_val:.4f}, PosLoss={step_pos_val:.5f}, VertLoss={step_vert_val:.4f}) | PosErr={step_pos_err_val:.1f}mm | TiltErr={step_tilt_err_val:.1f}°")
+            loss_detail = f"FlowLoss={step_flow_val:.4f}" if args.loss_mode == "pure_flow" else f"7D-MSE={step_7d_val:.5f}"
+            print(f"    Trial step {i+1}/{trial_steps}: Loss={step_loss_val:.5f} ({loss_detail}) | PosErr={step_pos_err_val:.1f}mm | RotErr={step_rot_err_val:.2f}° | GripErr={step_grip_err_val:.3f}")
         t_bench_end = time.perf_counter()
 
         elapsed_bench = t_bench_end - t_bench_start
@@ -609,49 +623,54 @@ def main():
         print(f"  [*] Step Latency:     {step_time_s*1000:.1f} ms / step ({steps_per_sec:.2f} steps/sec)")
         print(f"  [*] Estimated Time:   {est_total_min:.1f} minutes for {args.steps} steps")
         print("=" * 85)
-        print("\n[Preflight Passed] Empirical benchmark passed. Ready for full execution.")
+        print(f"\n[Preflight Passed] Empirical benchmark passed for [{args.loss_mode.upper()}]. Ready for full execution.")
         return 0
 
     # Initial Baseline Eval on all tasks
-    print(f"\n[Initial Baseline Eval @ Step 0 across all {len(eval_samples)} Tasks]")
+    print("\n" + "=" * 85)
+    print("  INITIAL ZERO-SHOT EVALUATION (BEFORE TRAINING)")
+    print("=" * 85)
     net.eval()
     for t_name, s_eval in eval_samples.items():
         res = evaluate_sample(inference, s_eval, cached_files, dfk=dfk)
-        tilt_str = f" | Tilt={res['ee_tilt_deg']:.1f}°" if res.get('ee_tilt_deg') is not None else ""
         pos_str = f" | EE PosErr={res['ee_pos_err_mm']:.1f}mm" if res.get('ee_pos_err_mm') is not None else ""
-        print(f"  Task '{t_name:30s}': MSE={res['action_mse']:.6f} | Joint MAE={res['joint_mae_deg']:.2f}° (Hold: {res['hold_still_mae_deg']:.2f}°){pos_str}{tilt_str} | Grip={res['pred_chunk'][:, 7].mean():.2f}")
-    net.train()
+        rot_str = f" | RotErr={res['ee_rot_err_deg']:.2f}°" if res.get('ee_rot_err_deg') is not None else ""
+        print(f"  Task '{t_name:30s}': MSE={res['action_mse']:.6f} | Joint MAE={res['joint_mae_deg']:.2f}° (Hold: {res['hold_still_mae_deg']:.2f}°){pos_str}{rot_str} | Grip={res['pred_chunk'][:, 7].mean():.2f}")
+    print("=" * 85)
 
+    # 5. Training Loop
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"\n[Training Started] Running {args.steps} steps with effective batch_size={args.batch_size * args.grad_accum}...")
+    print(f"\n[Training] Commencing {args.steps} steps of multi-task LoRA fine-tuning...")
+    print(f"[*] Checkpoints will be saved to: {args.output_dir}")
 
+    net.train()
     losses = []
     flow_losses = []
-    cart_losses = []
-    vert_losses = []
+    l7d_losses = []
     pos_errors = []
-    tilt_errors = []
+    rot_errors = []
+    grip_errors = []
     t_start = time.perf_counter()
 
     for step in range(1, args.steps + 1):
         optimizer.zero_grad()
         accum_loss = 0.0
         accum_flow = 0.0
-        accum_cart = 0.0
-        accum_vert = 0.0
+        accum_7d = 0.0
         accum_pos_err = 0.0
-        accum_tilt_err = 0.0
+        accum_rot_err = 0.0
+        accum_grip_err = 0.0
 
         for _ in range(args.grad_accum):
             f_t, w_t, s_t, a_t, t_list = sample_balanced_batch(args.batch_size)
-            tot_l, f_l, p_l, v_l, p_err, t_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
+            tot_l, f_l, l7d, p_err, r_err, g_err = compute_loss(f_t, w_t, s_t, a_t, t_list, args.batch_size)
             (tot_l / args.grad_accum).backward()
             accum_loss += tot_l.item() / args.grad_accum
             accum_flow += f_l.item() / args.grad_accum
-            accum_cart += p_l.item() / args.grad_accum
-            accum_vert += v_l.item() / args.grad_accum
+            accum_7d += l7d.item() / args.grad_accum
             accum_pos_err += p_err / args.grad_accum
-            accum_tilt_err += t_err / args.grad_accum
+            accum_rot_err += r_err / args.grad_accum
+            accum_grip_err += g_err / args.grad_accum
 
         torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
         optimizer.step()
@@ -659,22 +678,23 @@ def main():
 
         losses.append(accum_loss)
         flow_losses.append(accum_flow)
-        cart_losses.append(accum_cart)
-        vert_losses.append(accum_vert)
+        l7d_losses.append(accum_7d)
         pos_errors.append(accum_pos_err)
-        tilt_errors.append(accum_tilt_err)
+        rot_errors.append(accum_rot_err)
+        grip_errors.append(accum_grip_err)
 
         if step % args.log_freq == 0:
             avg_loss = np.mean(losses[-args.log_freq:])
             avg_flow = np.mean(flow_losses[-args.log_freq:])
-            avg_cart = np.mean(cart_losses[-args.log_freq:])
-            avg_vert = np.mean(vert_losses[-args.log_freq:])
+            avg_7d = np.mean(l7d_losses[-args.log_freq:])
             avg_pos_err = np.mean(pos_errors[-args.log_freq:])
-            avg_tilt_err = np.mean(tilt_errors[-args.log_freq:])
+            avg_rot_err = np.mean(rot_errors[-args.log_freq:])
+            avg_grip_err = np.mean(grip_errors[-args.log_freq:])
             cur_lr = scheduler.get_last_lr()[0]
             elapsed = time.perf_counter() - t_start
             steps_per_sec = step / elapsed
-            print(f"  [Step {step:04d}/{args.steps:04d}] Loss: {avg_loss:.4f} (Flow: {avg_flow:.4f}, PosLoss: {avg_cart:.5f}, VertLoss: {avg_vert:.4f}) | PosErr: {avg_pos_err:.1f}mm | TiltErr: {avg_tilt_err:.1f}° | LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} s/s | Elapsed: {elapsed/60:.1f}m")
+            loss_str = f"FlowLoss: {avg_flow:.4f}" if args.loss_mode == "pure_flow" else f"7D-MSE: {avg_7d:.5f}"
+            print(f"  [Step {step:04d}/{args.steps:04d}] {loss_str} | PosErr: {avg_pos_err:.1f}mm | RotErr: {avg_rot_err:.2f}° | GripErr: {avg_grip_err:.3f} | LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} s/s | Elapsed: {elapsed/60:.1f}m")
 
         if step % args.eval_freq == 0:
             net.eval()
@@ -683,9 +703,9 @@ def main():
             for t_name, s_eval in eval_samples.items():
                 res = evaluate_sample(inference, s_eval, cached_files, dfk=dfk)
                 eval_maes.append(res['joint_mae_deg'])
-                tilt_str = f" | Tilt={res['ee_tilt_deg']:.1f}°" if res.get('ee_tilt_deg') is not None else ""
+                rot_str = f" | RotErr={res['ee_rot_err_deg']:.2f}°" if res.get('ee_rot_err_deg') is not None else ""
                 pos_str = f" | EE PosErr={res['ee_pos_err_mm']:.1f}mm" if res.get('ee_pos_err_mm') is not None else ""
-                print(f"      '{t_name:30s}': MSE={res['action_mse']:.6f} | MAE={res['joint_mae_deg']:.2f}° (Hold={res['hold_still_mae_deg']:.2f}°){pos_str}{tilt_str} | Grip={res['pred_chunk'][:, 7].mean():.2f}")
+                print(f"      '{t_name:30s}': MSE={res['action_mse']:.6f} | MAE={res['joint_mae_deg']:.2f}° (Hold={res['hold_still_mae_deg']:.2f}°){pos_str}{rot_str} | Grip={res['pred_chunk'][:, 7].mean():.2f}")
             print(f"      [Mean Joint MAE across all {len(eval_samples)} tasks: {np.mean(eval_maes):.2f}°]\n")
             net.train()
 
@@ -694,12 +714,13 @@ def main():
             state_dict = extract_lora_state_dict(net)
             torch.save({
                 "step": step,
+                "loss_mode": args.loss_mode,
                 "loss": float(np.mean(losses[-50:])),
                 "flow_loss": float(np.mean(flow_losses[-50:])),
-                "cartesian_loss": float(np.mean(cart_losses[-50:])),
-                "vertical_loss": float(np.mean(vert_losses[-50:])),
+                "cartesian_7d_loss": float(np.mean(l7d_losses[-50:])),
                 "pos_err_mm": float(np.mean(pos_errors[-50:])),
-                "tilt_err_deg": float(np.mean(tilt_errors[-50:])),
+                "rot_err_deg": float(np.mean(rot_errors[-50:])),
+                "grip_err": float(np.mean(grip_errors[-50:])),
                 "state_dict": state_dict,
                 "lang_rank": args.lang_rank,
                 "expert_rank": args.expert_rank,
@@ -711,7 +732,7 @@ def main():
 
     total_time = time.perf_counter() - t_start
     print("\n" + "=" * 85)
-    print(f"  LoRA MULTI-TASK FINE-TUNING COMPLETED in {total_time/60:.1f} minutes!")
+    print(f"  LoRA MULTI-TASK FINE-TUNING [{args.loss_mode.upper()}] COMPLETED in {total_time/60:.1f} minutes!")
     print(f"  Checkpoints saved in: {args.output_dir}")
     print("=" * 85)
 
