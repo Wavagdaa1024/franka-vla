@@ -20,5 +20,5 @@ echo   Resolution:  640x480 @ 30 FPS
 echo   Web Stream:  http://0.0.0.0:8080 (LAN Accessible)
 echo ===============================================================================
 
-"%PY%" -u scripts\live_camera_stream.py %*
+"%PY%" -u scripts\python\live_camera_stream.py %*
 exit /b %errorlevel%

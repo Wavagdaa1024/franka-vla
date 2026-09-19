@@ -27,15 +27,20 @@ franka-vla/
 │   ├── test_kinematics_and_rtc.py        <-- 运动学、零空间自稳与闭环控制单测 (10项全通)
 │   └── test_differentiable_fk.py         <-- 可微正向运动学 (DFK) 梯度求导单测
 │
-├── scripts/                              <-- 【用户统一操作入口层 (CLI & Launchers)】
+├── scripts/                              <-- 【用户统一操作入口层 (一键批处理)】
+│   ├── python/                           <-- 【底层核心 Python 脚本模块】
+│   │   ├── async_rtc_vla_agent.py        <-- 实机/模拟 VLA 异步推理核心
+│   │   ├── train_pi05_lora.py            <-- Pi0.5 LoRA 微调训练引擎
+│   │   ├── live_camera_stream.py         <-- 双摄持续实时流与 Web 推流
+│   │   └── list_ckpts.py                 <-- 训练检查点结构化扫描查询
 │   ├── run_agent.bat                     <-- 实机推理主入口 (绑定 GPU 1, 默认 Step 1500 权重)
 │   ├── train_cartesian_lora_gpu0.bat     <-- DFK LoRA 训练入口 (绑定 GPU 0, 姿态锁死防滑移)
 │   ├── train_red_cube_lora_gpu0.bat      <-- 纯关节 LoRA 训练入口 (绑定 GPU 0)
-│   ├── live_camera.bat                   <-- 双摄持续监控入口 (OpenCV 窗口 + HTTP Web 推流)
+│   ├── live_camera.bat                   <-- 双摄持续监控入口 (OpenCV 窗口 + HTTP Web:8080)
 │   ├── check_cameras.bat                 <-- 双摄硬件快速体检 (采样 15 帧核验)
 │   ├── align_camera.bat                  <-- 相机复位与手眼对齐入口 (转发至 tests/camera_alignment)
 │   ├── launch_record.bat                 <-- 真机遥操作录制
-│   └── list_ckpts.py                     <-- 检查点查询工具
+│   └── list_ckpts.bat                    <-- 检查点清单一键查询
 │
 ├── outputs/                              <-- 训练权重、测试日志、提取切片 (已被 .gitignore 保护)
 ├── dataset/                              <-- 官方格式轨迹数据集 (已被 .gitignore 保护)
@@ -56,11 +61,11 @@ franka-vla/
 | **实机推理 (安全滤波)** | `scripts\run_agent.bat --rtc --checkpoint cartesian_1000` | 开启零空间姿态自稳与实时速度平滑滤波 | GPU 1 (RTX 5090) |
 | **推理虚跑自检** | `scripts\run_agent.bat --mock --checkpoint cartesian_1000` | GPU 1 模型加载自测，不连机械臂与摄像头 | GPU 1 (RTX 5090) |
 | **模型微调训练** | `scripts\train_cartesian_lora_gpu0.bat` | GPU 0 训练带 DFK 笛卡尔空间损失与垂直向下倾角约束的 LoRA | GPU 0 (独立运行) |
-| **双摄实时监控** | `scripts\live_camera.bat --web` | 打开双目相机实时流，浏览器访问 `http://localhost:5000` 查看 | CPU / USB |
+| **双摄实时监控** | `scripts\live_camera.bat --web` | 打开双目相机实时流，浏览器访问 `http://localhost:8080` 查看 | CPU / USB |
 | **双摄硬件体检** | `scripts\check_cameras.bat` | 快速捕获 15 帧排查掉帧、色彩与设备序列号 | CPU / USB |
 | **相机复位与标定** | `scripts\align_camera.bat` | 运行 ChArUco 6-DoF 相机快速复位与半透明叠图 (Web: `8088`) | CPU / RealSense |
 | **真机数据录制** | `scripts\launch_record.bat` | 实机遥操数据同步录制入口 | Franka + RealSense |
-| **权重清单查询** | `python scripts\list_ckpts.py` | 打印当前服务器所有训练完成的 Checkpoints 路径与步数 | 本地查询 |
+| **权重清单查询** | `scripts\list_ckpts.bat` | 打印当前服务器所有训练完成的 Checkpoints 路径与步数 | 本地查询 |
 
 ---
 

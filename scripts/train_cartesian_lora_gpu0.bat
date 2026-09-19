@@ -25,5 +25,5 @@ echo   Steps:          2000
 echo   Batch:          4 (effective 8 with grad accum 2)
 echo ===========================================================================
 
-"%PY%" -u scripts\train_pi05_lora.py --dataset dataset\teleop_pick_cube_15hz_001 dataset\teleop_pick_cube_15hz_002 --task-filter "red cube" --output-dir outputs\checkpoints\pi05_lora_cartesian_dfk --cartesian-loss-weight 5.0 --vertical-loss-weight 2.0 --steps 2000 --save-freq 500 --eval-freq 250 %*
+"%PY%" -u scripts\python\train_pi05_lora.py --dataset dataset\teleop_pick_cube_15hz_001 dataset\teleop_pick_cube_15hz_002 --task-filter "red cube" --output-dir outputs\checkpoints\pi05_lora_cartesian_dfk --cartesian-loss-weight 5.0 --vertical-loss-weight 2.0 --steps 2000 --save-freq 500 --eval-freq 250 %*
 exit /b %errorlevel%

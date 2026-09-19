@@ -42,3 +42,6 @@ runs/
 *.swp
 Thumbs.db
 Desktop.ini
+
+*.zip
+*.tar.gz

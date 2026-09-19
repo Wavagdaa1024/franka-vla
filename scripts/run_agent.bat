@@ -22,5 +22,5 @@ echo   Default Ckpt: pi05_lora_red_cube\step_1500 (Pure Red Cube LoRA)
 echo   Python Env:   %PY%
 echo ===============================================================================
 
-"%PY%" -u scripts\async_rtc_vla_agent.py %*
+"%PY%" -u scripts\python\async_rtc_vla_agent.py %*
 exit /b %errorlevel%

@@ -2,8 +2,11 @@ from pathlib import Path
 import torch
 import json
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+ckpt_dir = PROJECT_ROOT / 'outputs' / 'checkpoints'
+
 res = []
-for p in sorted(Path('outputs/checkpoints').glob('*/*.pt')):
+for p in sorted(ckpt_dir.glob("*/*.pt")):
     try:
         c = torch.load(p, map_location='cpu', weights_only=False)
         sd = c.get('state_dict', c.get('model_state_dict', c))
