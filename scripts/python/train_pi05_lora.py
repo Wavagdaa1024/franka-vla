@@ -24,6 +24,8 @@ import json
 import time
 import random
 import shutil
+import subprocess
+import hashlib
 from pathlib import Path
 from collections import defaultdict
 
@@ -53,6 +55,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from franka_teleop.pi05_engine.runtime import PI05Inference
+from franka_teleop.pi05_engine.contracts import (read_checkpoint, checkpoint_state, validate_resume, ACTION_SEMANTICS, PRECISION)
 from franka_teleop.pi05_engine.lora import (
     inject_pi05_lora,
     extract_lora_state_dict,
@@ -71,7 +74,7 @@ TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
 DEFAULT_DATASET_DIRS = [
     REPO_ROOT / "dataset" / "teleop_pick_cube_15hz_002",
 ]
-DEFAULT_OUTPUT_CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k"
+DEFAULT_OUTPUT_CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_v2_20k"
 
 CHUNK_SIZE = 15
 DEFAULT_BATCH_SIZE = 4
@@ -300,8 +303,15 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
         "observation.images.left_wrist_0_rgb": wrist_t,
         "observation.state": curr_state,
     }
+    # A stable per-sample noise tensor makes checkpoints comparable without
+    # consuming training RNG state or depending on Python's randomized hash().
+    identity = f"{s['file_key']}:{f_idx}:{s['task']}"
+    seed = int.from_bytes(hashlib.sha256(identity.encode("utf-8")).digest()[:8], "little")
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    noise = torch.randn((1, inference.config.chunk_size, inference.config.max_action_dim),
+                        generator=generator, dtype=torch.float32)
     with torch.no_grad():
-        pred_chunk = inference.predict_action_chunk(obs, s["task"]).cpu().numpy()[0]
+        pred_chunk = inference.predict_action_chunk(obs, s["task"], noise=noise).cpu().numpy()[0]
 
     action_mse = float(np.mean((pred_chunk - gt_action_chunk) ** 2))
     joint_mse = float(np.mean((pred_chunk[:, :7] - gt_delta_q) ** 2))
@@ -409,8 +419,31 @@ def main():
     parser.add_argument("--loss-mode", type=str, default="pure_flow", help="Legacy compatibility flag (always 'pure_flow')")
     parser.add_argument("--state-noise", type=float, default=0.0, help="Legacy compatibility flag (state noise is strictly disabled 0.0)")
     parser.add_argument("--wandb-mode", type=str, choices=("online", "offline", "disabled"), default="online", help="W&B mode (default: online)")
-    parser.add_argument("--image-crop", type=str, choices=("16_9", "none"), default="none", help="Image preprocessing crop mode (default: none / 4:3 native)")
+    parser.add_argument("--image-crop", type=str, choices=("16_9", "none"), default=None, help="Crop mode; new training defaults to none, resume inherits saved metadata")
+    parser.add_argument("--resume-mode", choices=("strict", "migrate"), default="strict",
+                        help="strict: same training contract; migrate: weights only, reset optimizer and step")
     args = parser.parse_args()
+    resume_ckpt = read_checkpoint(args.resume) if args.resume else None
+    if args.image_crop is None:
+        saved_crop = resume_ckpt.get("image_crop") if resume_ckpt else None
+        if resume_ckpt is not None and args.resume_mode == "migrate" and saved_crop is None:
+            raise ValueError("Legacy migration requires explicit --image-crop none or 16_9")
+        args.image_crop = saved_crop or "none"
+    if resume_ckpt is not None:
+        validate_resume(resume_ckpt, args)
+        if args.resume_mode == "migrate" and args.output_dir.resolve() == args.resume.parent.resolve():
+            raise ValueError("Migration requires a new output directory")
+        old_id = resume_ckpt.get("args", {}).get("wandb_id")
+        if args.resume_mode == "migrate" and args.wandb_id and args.wandb_id == old_id:
+            raise ValueError("Migration requires a new W&B run ID")
+    if (resume_ckpt is None or args.resume_mode == "migrate") and any(args.output_dir.glob("*.pt")):
+        raise ValueError("New training/migration output directory already contains checkpoints")
+    try:
+        source_revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT, text=True).strip()
+        source_dirty = bool(subprocess.check_output(["git", "diff", "--name-only", "HEAD"], cwd=REPO_ROOT, text=True).strip())
+    except (OSError, subprocess.CalledProcessError):
+        source_revision, source_dirty = "unknown", True
+
 
     print("=" * 85)
     print(f"  PI0.5 CLEAN PURE JOINT FLOW MATCHING LORA PIPELINE (CROP: {args.image_crop.upper()})")
@@ -443,6 +476,9 @@ def main():
         val_seed=args.val_seed,
         crop_16_9=(args.image_crop == "16_9")
     )
+
+    if resume_ckpt is not None:
+        validate_resume(resume_ckpt, args, val_ep_set)
 
     task_names = sorted(list(train_task_buckets.keys()))
 
@@ -542,38 +578,25 @@ def main():
         min_ratio = 1e-6 / args.lr
         return max(min_ratio, cos_factor)
 
-    # Resume checkpoint if specified
     start_step = 1
-    if args.resume and args.resume.exists():
-        print(f"\n[Resume] Loading checkpoint from {args.resume}...")
-        ckpt = torch.load(args.resume, map_location="cuda:0", weights_only=False)
-        if "state_dict" in ckpt:
-            load_lora_state_dict(net, ckpt["state_dict"])
-        start_step = ckpt.get("step", 0) + 1
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                print("[Resume OK] Restored optimizer momentum states.")
-            except Exception as e:
-                print(f"[Resume Note] Fresh optimizer momentum initialized: {e}")
-        print(f"[Resume] Successfully loaded weights! Resuming training from step {start_step} to {args.steps}...")
+    if resume_ckpt is not None:
+        load_lora_state_dict(net, checkpoint_state(resume_ckpt), strict=True)
+        if args.resume_mode == "strict":
+            optimizer.load_state_dict(resume_ckpt["optimizer_state_dict"])
+            start_step = int(resume_ckpt["step"]) + 1
+            if start_step > args.steps:
+                raise ValueError("Checkpoint already reached requested total steps")
+        else:
+            print("[Migration] Loaded weights only; optimizer/scheduler/step reset for new experiment")
 
-    for group in optimizer.param_groups:
-        group.setdefault("initial_lr", group["lr"])
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lr_lambda=lr_lambda,
-        last_epoch=(start_step - 1) if start_step > 1 else -1
-    )
-    if start_step > 1:
-        if args.resume and args.resume.exists() and "scheduler_state_dict" in ckpt:
-            try:
-                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                print("[Resume OK] Restored scheduler state.")
-            except Exception:
-                pass
-        print(f"[Scheduler] Advanced scheduler to step {start_step - 1} (Resumed LR: {scheduler.get_last_lr()[0]:.2e})")
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    if resume_ckpt is not None and args.resume_mode == "strict":
+        scheduler.load_state_dict(resume_ckpt["scheduler_state_dict"])
+        # LambdaLR constructor adjusts lr; restore the saved current lr afterwards.
+        for group, saved in zip(optimizer.param_groups, resume_ckpt["optimizer_state_dict"]["param_groups"]):
+            group["lr"] = saved["lr"]
+        print(f"[Resume] Step {start_step}, crop={args.image_crop}, FP32 contract validated")
+    del resume_ckpt
 
     beta_dist = Beta(
         torch.tensor(getattr(net.config, "time_sampling_beta_alpha", 1.5), device="cuda:0"),
@@ -851,6 +874,8 @@ def main():
             if wandb_run:
                 wandb.log({
                     "val/action_mse": val_agg.get("action_mse", 0.0),
+                    "val/samples_evaluated": val_agg.get("val_samples_count", 0),
+                    "val/pool_size": len(val_samples),
                     "val/joint_mae_deg": val_agg.get("joint_mae_deg", 0.0),
                     "val/hold_still_mae_deg": val_agg.get("hold_still_mae_deg", 0.0),
                     "val/improve_pct": val_agg.get("improve_pct", 0.0),
@@ -876,9 +901,14 @@ def main():
                 "lora_dropout": args.lora_dropout,
                 "args": vars(args),
                 "val_episodes": list(val_ep_set),
-                "action_semantics": "v2_gripper_action_command",
+                "action_semantics": ACTION_SEMANTICS,
                 "image_crop": args.image_crop,
-                "precision": "fp32_lora_and_projections",
+                "precision": PRECISION,
+                "source_revision": source_revision,
+                "source_dirty": source_dirty,
+                "validation_noise": "sha256_sample_identity_cpu_v1",
+                "lang_alpha": float(args.lang_rank * 2),
+                "expert_alpha": float(args.expert_rank * 2),
                 "timestamp": time.time(),
             }
             torch.save(save_payload, ckpt_path)

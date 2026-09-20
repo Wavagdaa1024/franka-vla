@@ -36,6 +36,7 @@ import struct
 import argparse
 import threading
 import queue
+import math
 import numpy as np
 
 try:
@@ -176,6 +177,7 @@ class AsyncChunkClient:
             self.conn.settimeout(10.0)
         except Exception:
             pass
+        self.request_seq = 0
         self.req_queue = queue.Queue(maxsize=1)
         self.resp_queue = queue.Queue(maxsize=2)
         self.stop_event = threading.Event()
@@ -189,13 +191,18 @@ class AsyncChunkClient:
             except queue.Empty:
                 continue
 
-            t0 = time.time()
-            if not send_json(self.conn, msg):
+            t0 = time.monotonic()
+            wire_msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+            if not send_json(self.conn, wire_msg):
                 break
             resp = recv_json(self.conn)
             if resp is None:
                 break
-            resp["latency_ms"] = (time.time() - t0) * 1000.0
+            resp["latency_ms"] = (time.monotonic() - t0) * 1000.0
+            # One request/response at a time on this socket. Bind local timing here,
+            # never subtract clocks from two machines or trust remote timing fields.
+            resp["_requested_at"] = msg["_requested_at"]
+            resp["_request_id"] = msg["_request_id"]
 
             try:
                 self.resp_queue.put_nowait(resp)
@@ -208,7 +215,9 @@ class AsyncChunkClient:
 
     def request_chunk(self, state_msg):
         try:
-            self.req_queue.put_nowait(state_msg)
+            self.request_seq += 1
+            request = dict(state_msg, _requested_at=time.monotonic(), _request_id=self.request_seq)
+            self.req_queue.put_nowait(request)
             return True
         except queue.Full:
             return False
@@ -237,6 +246,24 @@ class AsyncChunkClient:
         except Exception:
             pass
         self.thread.join(timeout=1.0)
+
+
+def chunk_start_index(chunk, now, dt=DT, last_request_id=-1):
+    """Return the unexpired action index, or None for hold/expired/duplicate responses."""
+    if chunk.get("hold"):
+        return None
+    stamp = chunk.get("_requested_at")
+    request_id = chunk.get("_request_id", -1)
+    if stamp is None or not math.isfinite(stamp) or request_id <= last_request_id:
+        return None
+    age = now - stamp
+    if not math.isfinite(age) or age < 0:
+        return None
+    positions = chunk.get("joint_positions", [])
+    mode = chunk.get("action_mode", "joint_position" if positions else "joint_velocity")
+    targets = positions if mode == "joint_position" else chunk.get("joint_velocities", [])
+    index = int(math.floor(age / dt))
+    return index if index < len(targets) else None
 
 
 def read_gripper_normalized(arm, default=0.0):
@@ -306,9 +333,14 @@ def run_rtc_loop(arm, conn, args):
 
     print(f"[Bootstrap OK] Received Chunk 0 ({total_steps} steps, Infer: {active_chunk.get('latency_ms', 0):.0f}ms). Starting continuous RTC...")
 
-    step_in_chunk = 0
+    step_in_chunk = chunk_start_index(active_chunk, time.monotonic())
+    if step_in_chunk is None:
+        print("[ERROR] Bootstrap observation is invalid or expired; holding.")
+        arm.stop()
+        client.stop()
+        return 0, t_start
+    last_request_id = active_chunk["_request_id"]
     prefetch_sent = False
-    prefetch_step_in_chunk = 0
     next_chunk = None
     t_starve_start = None
     MAX_STARVATION_SECS = 5.0
@@ -321,102 +353,67 @@ def run_rtc_loop(arm, conn, args):
                 rate.sleep()
                 continue
 
-            # 1. Trigger asynchronous prefetch early in chunk execution
-            if step_in_chunk >= args.preempt_step and not prefetch_sent:
-                prefetch_time = time.time()
-                prefetch_step_in_chunk = step_in_chunk
-                state_msg = {
-                    "loop": chunk_idx + 1,
-                    "q": curr_q.tolist(),
-                    "pos": curr_pos.tolist(),
-                    "gripper": read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0)),
-                    "prefetch_step": prefetch_step_in_chunk,
-                    "timestamp": prefetch_time,
-                }
-                if client.request_chunk(state_msg):
-                    prefetch_sent = True
+            # Progress against the original controller-side observation time.
+            active_index = chunk_start_index(active_chunk, time.monotonic())
+            step_in_chunk = max(step_in_chunk, total_steps if active_index is None else active_index)
+            if step_in_chunk >= args.preempt_step and not prefetch_sent and next_chunk is None:
+                prefetch_sent = client.request_chunk({
+                    "loop": chunk_idx + 1, "q": curr_q.tolist(), "pos": curr_pos.tolist(),
+                    "gripper": read_gripper_normalized(arm, default=float(gripper_state)),
+                })
 
-            # 2. Check if newly prefetched chunk has arrived
             fresh_chunk = client.get_chunk(block=False)
             if fresh_chunk is not None:
                 next_chunk = fresh_chunk
-                lat = next_chunk.get("latency_ms", 0)
-                tilt_max = next_chunk.get("max_tilt_deg", 0.0)
-                z_clamped = next_chunk.get("z_clamped_count", 0)
-                clamp_info = f" | [CLAMP x{z_clamped}]" if z_clamped > 0 else ""
-                print(f"[RTC Chunk #{chunk_idx + 1:03d} Ready] Lat: {lat:3.0f}ms | Tilt: {tilt_max:.2f}°{clamp_info}")
 
-            # 3. Continuous Handover when stride is reached and next chunk is ready
-            if step_in_chunk >= args.steps_per_chunk and next_chunk is not None:
-                active_chunk = next_chunk
-                pos_targets = active_chunk.get("joint_positions", [])
-                vel_targets = active_chunk.get("joint_velocities", [])
-                grip_targets = active_chunk.get("gripper", [])
-                action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
-                use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
-                total_steps = len(pos_targets) if use_pos else len(vel_targets)
-
-                # Compensate for elapsed steps since observation was captured for prefetch
-                elapsed_steps = max(0, step_in_chunk - prefetch_step_in_chunk)
-                step_in_chunk = min(elapsed_steps, max(0, total_steps - 1))
-
-                prefetch_sent = False
-                prefetch_step_in_chunk = step_in_chunk
+            # Every receive path (including starvation) activates here.
+            if next_chunk is not None and (next_chunk.get("hold") or step_in_chunk >= args.steps_per_chunk):
+                candidate = next_chunk
                 next_chunk = None
-                chunk_idx += 1
-                t_starve_start = None
-                client.drain_responses()
-                p_now, _ = arm.get_cartesian_pose()
-                print(f"[Continuous Handover #{chunk_idx:03d}] EE: [{p_now[0]:.3f}, {p_now[1]:.3f}, {p_now[2]:.3f}] | Age Aligned: starting at step {step_in_chunk}/{total_steps} (compensated {elapsed_steps} steps)")
-
-            # 4. Target extraction & Starvation Fallback
-            total_steps = len(pos_targets) if use_pos else len(vel_targets)
-            if total_steps == 0:
-                print(f"  [RTC #{chunk_idx:03d}] Error: Empty target chunk received. Terminating.")
-                break
-
-            if step_in_chunk >= total_steps:
-                if not client.is_alive():
-                    print(f"  [RTC #{chunk_idx:03d}] GPU Agent connection terminated. Exiting.")
-                    break
-                if t_starve_start is None:
-                    t_starve_start = time.time()
-                elif time.time() - t_starve_start > MAX_STARVATION_SECS:
-                    print(f"  [RTC #{chunk_idx:03d}] Buffer starvation timeout (> {MAX_STARVATION_SECS:.1f}s). Exiting safely.")
-                    break
-
-                # Starvation fallback: wait briefly for fresh chunk
-                print(f"  [RTC #{chunk_idx:03d}] Buffer Starvation! Waiting for next chunk...")
-                fresh = client.get_chunk(block=True, timeout=0.5)
-                if fresh is not None:
-                    active_chunk = fresh
-                    pos_targets = active_chunk.get("joint_positions", [])
-                    vel_targets = active_chunk.get("joint_velocities", [])
-                    grip_targets = active_chunk.get("gripper", [])
-                    action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
-                    use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
-                    step_in_chunk = 0
-                    prefetch_sent = False
-                    chunk_idx += 1
-                    t_starve_start = None
-                    client.drain_responses()
-                    continue
-                else:
-                    if not prefetch_sent:
-                        req_msg = {
-                            "loop": chunk_idx + 1,
-                            "q": curr_q.tolist(),
-                            "pos": curr_pos.tolist(),
-                            "gripper": read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0))
-                        }
-                        if client.request_chunk(req_msg):
-                            prefetch_sent = True
+                prefetch_sent = False
+                start_index = chunk_start_index(candidate, time.monotonic(), last_request_id=last_request_id)
+                if start_index is None:
+                    print("[RTC] Invalid, duplicate or expired chunk discarded; holding for a fresh observation.")
                     arm.stop()
                     prev_dq = np.zeros(7)
-                    rate.sleep()
-                    continue
-            else:
-                t_starve_start = None
+                    step_in_chunk = total_steps
+                else:
+                    active_chunk = candidate
+                    last_request_id = candidate["_request_id"]
+                    pos_targets = candidate.get("joint_positions", [])
+                    vel_targets = candidate.get("joint_velocities", [])
+                    grip_targets = candidate.get("gripper", [])
+                    action_mode = candidate.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
+                    use_pos = action_mode == "joint_position" and len(pos_targets) > 0
+                    total_steps = len(pos_targets) if use_pos else len(vel_targets)
+                    step_in_chunk = start_index
+                    chunk_idx += 1
+                    t_starve_start = None
+                    print(f"[RTC Handover #{chunk_idx:03d}] starting at {start_index}/{total_steps}")
+
+            if step_in_chunk >= total_steps:
+                # Stop before the blocking receive, not after its timeout.
+                arm.stop()
+                prev_dq = np.zeros(7)
+                if not client.is_alive():
+                    break
+                if t_starve_start is None:
+                    t_starve_start = time.monotonic()
+                elif time.monotonic() - t_starve_start > MAX_STARVATION_SECS:
+                    print("[RTC] Buffer starvation timeout; stopping.")
+                    break
+                if not prefetch_sent and next_chunk is None:
+                    prefetch_sent = client.request_chunk({
+                        "loop": chunk_idx + 1, "q": curr_q.tolist(), "pos": curr_pos.tolist(),
+                        "gripper": read_gripper_normalized(arm, default=float(gripper_state)),
+                    })
+                fresh = client.get_chunk(block=True, timeout=0.5)
+                if fresh is not None:
+                    next_chunk = fresh
+                # No separate index=0 path: next iteration uses the same age validation.
+                rate.sleep()
+                continue
+            t_starve_start = None
 
             if use_pos:
                 q_des = np.array(pos_targets[step_in_chunk], dtype=np.float64)
@@ -497,6 +494,7 @@ def run_rtc_loop(arm, conn, args):
     except Exception as e:
         print(f"\n[WARN] RTC loop exception: {e}")
     finally:
+        arm.stop()
         client.stop()
 
     return chunk_idx, t_start

@@ -8,7 +8,7 @@ Features:
   - Strict physical GPU isolation (defaults to GPU 1, RTX 5090 32GB).
   - Fast JSON REST API (/predict, /health, /switch_checkpoint).
   - Base64 image decoding (Front + Wrist RealSense cameras).
-  - Microsecond-level LoRA checkpoint hot-swapping without reloading base 4.14B model.
+  - Validated LoRA checkpoint hot-swapping without reloading base 4.14B model.
   - Zero-dependency (pure Python standard library http.server + torch + cv2/PIL).
   - Built-in Web UI dashboard with live VRAM meter and interactive testing.
 """
@@ -43,6 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from franka_teleop.pi05_engine.runtime import PI05Inference
+from franka_teleop.pi05_engine.contracts import read_checkpoint, checkpoint_state, resolve_crop, lora_spec
 from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
 
 # Default Paths & Checkpoint Aliases
@@ -67,8 +68,10 @@ DEFAULT_CKPT = CKPT_ALIASES["pure_flow"]
 
 class VLAEngine:
     """Manages model lifecycle, warm-up, thread-safe inference, and checkpoint hot-swapping."""
-    def __init__(self, default_ckpt_key_or_path: str = "pure_flow", device: str = "cuda:0"):
+    def __init__(self, default_ckpt_key_or_path: str = "pure_flow", device: str = "cuda:0", image_crop: str = "auto"):
         self.device = device
+        self.image_crop = image_crop
+        self._lora_spec = None
         self.lock = threading.Lock()
         self.current_ckpt_info = {"name": "None", "path": "", "step": 0, "loss": 0.0, "type": "base"}
 
@@ -79,15 +82,14 @@ class VLAEngine:
             stats_path=STATS_PATH,
             tokenizer_path=TOKENIZER_PATH,
             device=self.device,
-            profile="droid_jointpos"
+            profile="droid_jointpos",
+            trainable_fp32=True
         )
         print(f"[VLA Engine] Base model loaded in {time.perf_counter()-t0:.2f}s.")
 
-        # Warm-up base model with dummy inputs
-        self._warmup()
-
-        # Load initial checkpoint
+        # Validate and load before warming up or accepting requests.
         self.load_checkpoint(default_ckpt_key_or_path)
+        self._warmup()
 
     def _warmup(self):
         """Runs single dummy inference pass to compile CUDA graphs and cache kernels."""
@@ -121,48 +123,31 @@ class VLAEngine:
         """Loads or hot-swaps a LoRA checkpoint into the active model."""
         with self.lock:
             ckpt_path = self.resolve_checkpoint_path(ckpt_key_or_path)
-            if not ckpt_path.exists():
-                print(f"[VLA Engine Warning] Checkpoint file {ckpt_path} does not exist. Using current weights.")
-                return {"status": "error", "message": f"Checkpoint file not found: {ckpt_path}"}
-
-            print(f"[VLA Engine] Loading weights from {ckpt_path.name}...")
-            ckpt = torch.load(str(ckpt_path), map_location=self.device, weights_only=False)
-            state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-
-            is_lora = any("lora_" in k for k in state_dict.keys()) or "lora" in str(ckpt_path).lower()
-            if is_lora:
-                lang_r = ckpt.get("lang_rank", 16)
-                exp_r = ckpt.get("expert_rank", 32)
-                # Check if LoRA is already injected
-                has_lora_layers = hasattr(self.inference.network.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj, "lora_A")
-                if not has_lora_layers:
-                    print(f"[VLA Engine] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
-                    inject_pi05_lora(self.inference.network, lang_rank=lang_r, expert_rank=exp_r)
-                load_lora_state_dict(self.inference.network, state_dict, strict=True)
-                step = ckpt.get("step", "?")
-                loss = ckpt.get("loss", 0.0)
-                loss_mode = ckpt.get("loss_mode", "lora")
-                self.current_ckpt_info = {
-                    "name": ckpt_path.stem,
-                    "path": str(ckpt_path),
-                    "step": step,
-                    "loss": loss,
-                    "loss_mode": loss_mode,
-                    "type": f"LoRA (Lang r={lang_r}, Expert r={exp_r})",
-                }
-                print(f"[VLA Engine OK] LoRA Checkpoint loaded! (Step: {step}, Loss: {loss:.5f})")
-                return {"status": "success", "info": self.current_ckpt_info}
-            else:
-                missing, unexpected = self.inference.network.load_state_dict(state_dict, strict=False)
-                self.current_ckpt_info = {
-                    "name": ckpt_path.stem,
-                    "path": str(ckpt_path),
-                    "step": ckpt.get("step", "?"),
-                    "loss": ckpt.get("loss", 0.0),
-                    "type": "Full Weight",
-                }
-                print(f"[VLA Engine OK] Full weights loaded from {ckpt_path.name}.")
-                return {"status": "success", "info": self.current_ckpt_info}
+            if not ckpt_path.is_file():
+                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+            ckpt = read_checkpoint(ckpt_path)
+            state_dict = checkpoint_state(ckpt)
+            crop = resolve_crop(ckpt, ckpt_path, self.image_crop)
+            if not any("lora_" in key for key in state_dict):
+                raise ValueError("HTTP hot-swap supports LoRA checkpoints only; use a dedicated process for full weights")
+            spec = lora_spec(ckpt)
+            if self._lora_spec is not None and spec != self._lora_spec:
+                raise ValueError("LoRA architecture differs from the running model; restart with the selected checkpoint")
+            if self._lora_spec is None:
+                inject_pi05_lora(self.inference.network, **spec)
+            load_lora_state_dict(self.inference.network, state_dict, strict=True)
+            self._lora_spec = spec
+            self.inference.network.eval()
+            self.inference.processor.crop_mode = crop
+            self.inference.reset()
+            self.current_ckpt_info = {
+                "name": ckpt_path.stem, "path": str(ckpt_path),
+                "step": ckpt.get("step", 0),
+                "loss": ckpt.get("flow_loss", ckpt.get("loss", 0.0)),
+                "type": "LoRA", "image_crop": crop,
+                "projection_precision": "float32",
+            }
+            return {"status": "success", "info": dict(self.current_ckpt_info)}
 
     def predict(self, front_rgb: np.ndarray, wrist_rgb: np.ndarray, state_8d: np.ndarray, task: str) -> dict:
         """Executes forward VLA policy inference."""
@@ -180,6 +165,7 @@ class VLAEngine:
             with torch.no_grad():
                 pred_chunk = self.inference.predict_action_chunk(obs, task)
                 pred_chunk_np = pred_chunk.cpu().numpy()[0]  # (15, 8)
+            checkpoint_name = self.current_ckpt_info["name"]
 
         torch.cuda.synchronize()
         latency_ms = (time.perf_counter() - t0) * 1000.0
@@ -198,7 +184,7 @@ class VLAEngine:
             "joint_positions": pred_abs_q,
             "joint_deltas": pred_delta_q.tolist(),
             "gripper": pred_gripper,
-            "checkpoint": self.current_ckpt_info["name"],
+            "checkpoint": checkpoint_name,
         }
 
 
@@ -367,9 +353,11 @@ def make_vla_handler(engine: VLAEngine):
                 if not ckpt:
                     self._send_json({"status": "error", "message": "Missing 'checkpoint' parameter"}, status=400)
                     return
-                res = engine.load_checkpoint(ckpt)
-                status_code = 200 if res["status"] == "success" else 400
-                self._send_json(res, status=status_code)
+                try:
+                    res = engine.load_checkpoint(ckpt)
+                    self._send_json(res)
+                except (ValueError, KeyError, FileNotFoundError) as exc:
+                    self._send_json({"status": "error", "message": str(exc)}, status=400)
 
             else:
                 self._send_json({"error": "Endpoint not found", "path": path}, status=404)
@@ -382,6 +370,7 @@ def main():
     parser.add_argument("--port", type=int, default=8088, help="Server port (default: 8088)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
     parser.add_argument("--checkpoint", type=str, default="pure_flow", help="Initial checkpoint alias or path")
+    parser.add_argument("--image-crop", choices=("auto", "none", "16_9"), default="auto")
     args = parser.parse_args()
 
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
@@ -394,7 +383,7 @@ def main():
     print(f"[*] Target GPU:        Physical GPU {gpu_id} (RTX 5090 32GB, CUDA_VISIBLE_DEVICES={gpu_id})")
     print("-" * 80)
 
-    engine = VLAEngine(default_ckpt_key_or_path=args.checkpoint, device="cuda:0")
+    engine = VLAEngine(default_ckpt_key_or_path=args.checkpoint, device="cuda:0", image_crop=args.image_crop)
     handler_cls = make_vla_handler(engine)
     server = ThreadedHTTPServer((args.host, args.port), handler_cls)
 

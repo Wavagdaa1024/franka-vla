@@ -44,6 +44,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from franka_teleop.pi05_engine.runtime import PI05Inference
+from franka_teleop.camera_frames import validated_frame_pair
+from franka_teleop.pi05_engine.contracts import read_checkpoint, checkpoint_state, resolve_crop, lora_spec
 from franka_teleop.live_guards import validate_joint_velocity_chunk, validate_joint_position_chunk
 from franka_teleop.kinematics import (
     forward_kinematics,
@@ -121,7 +123,7 @@ class DualRealSenseStreamer:
                         data = np.asanyarray(cf.get_data())
                         with self.lock:
                             self.frames[role] = data
-                            self.timestamps[role] = time.time()
+                            self.timestamps[role] = time.monotonic()
                 except Exception:
                     pass
         except Exception as e:
@@ -153,18 +155,10 @@ class DualRealSenseStreamer:
         print("[Cameras Warning] Warmup timeout, continuing with available frames.")
         return False
 
-    def get_frames(self, max_age_s: float = 0.5):
-        """Returns the most recent synchronized RGB frames, resilient to transient USB jitter."""
+    def get_frames(self, max_age_s: float = 0.5, max_sync_diff_s: float = 0.08):
         with self.lock:
-            now = time.time()
-            if self.frames["front"] is not None and (now - self.timestamps["front"]) <= max_age_s:
-                self.last_valid_frames["front"] = self.frames["front"]
-            if self.frames["wrist"] is not None and (now - self.timestamps["wrist"]) <= max_age_s:
-                self.last_valid_frames["wrist"] = self.frames["wrist"]
-
-            if self.last_valid_frames["front"] is not None and self.last_valid_frames["wrist"] is not None:
-                return self.last_valid_frames["front"].copy(), self.last_valid_frames["wrist"].copy()
-            return None, None
+            return validated_frame_pair(self.frames, self.timestamps, time.monotonic(),
+                                        max_age_s, max_sync_diff_s)
 
     def stop(self):
         self.stop_event.set()
@@ -232,6 +226,8 @@ def main():
     parser.add_argument("--live", action="store_true", default=True, help="Allow camera/network policy streaming (default: True)")
     parser.add_argument("--mock", action="store_true", default=False,
                         help="Run offline mock inference benchmark without connecting to physical cameras or Franka controller")
+    parser.add_argument("--image-crop", choices=("auto", "none", "16_9"), default="auto",
+                        help="Use checkpoint crop metadata; explicit mode required for unknown legacy weights")
     args = parser.parse_args()
 
     use_nullspace_lock = args.lock_vertical or args.enable_nullspace
@@ -267,17 +263,6 @@ def main():
         TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
         profile_name = "droid"
 
-    print(f"\n[2/3] Loading Pi0.5 ({profile_name}) from {CHECKPOINT_DIR.name} on GPU 1 (RTX 5090)...")
-    t0 = time.perf_counter()
-    model = PI05Inference.from_checkpoint(
-        CHECKPOINT_DIR,
-        stats_path=STATS_PATH,
-        tokenizer_path=TOKENIZER_PATH,
-        device="cuda:0",
-        profile=profile_name
-    )
-    print(f"[Model OK] Base model loaded in {time.perf_counter() - t0:.2f}s.")
-
     if args.checkpoint:
         ckpt_key = str(args.checkpoint).strip().lower()
         if ckpt_key in CKPT_ALIASES:
@@ -286,33 +271,48 @@ def main():
             ckpt_path = Path(args.checkpoint)
     else:
         ckpt_path = DEFAULT_LORA_CKPT if DEFAULT_LORA_CKPT.exists() else None
-    if ckpt_path and ckpt_path.exists():
-        print(f"[Model] Loading weights from {ckpt_path.name}...")
-        ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)
-        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-        is_lora = any("lora_" in k for k in state_dict.keys()) or "lora" in str(ckpt_path).lower()
-        if is_lora:
-            from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
-            lang_r = ckpt.get("lang_rank", 16)
-            exp_r = ckpt.get("expert_rank", 32)
-            print(f"[Model] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
-            inject_pi05_lora(model.network, lang_rank=lang_r, expert_rank=exp_r)
-            load_lora_state_dict(model.network, state_dict, strict=True)
-            print(f"[Model OK] LoRA Multi-Task Adapters loaded! (Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
-        else:
-            missing, unexpected = model.network.load_state_dict(state_dict, strict=False)
-            trainable_names = {name for name, _ in model.network.named_parameters()
-                               if any(part in name for part in ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"))}
-            missing_trainable = sorted(trainable_names.intersection(missing))
-            allowed_prefixes = ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out", "multi_modal_projector", "vision_tower")
-            unexpected_critical = [k for k in unexpected if not any(p in k for p in allowed_prefixes)]
-            if missing_trainable or unexpected_critical:
-                raise RuntimeError(f"checkpoint mismatch: missing_trainable={missing_trainable}, unexpected={unexpected_critical}")
-            has_vision = any("vision_tower" in k or "multi_modal_projector" in k for k in state_dict)
-            vision_tag = " (+Vision Tuned)" if has_vision else ""
-            print(f"[Model OK] Fine-tuned Action Expert{vision_tag} loaded! (File: {ckpt_path.name}, Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
+    if ckpt_path is None or not ckpt_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+    ckpt = read_checkpoint(ckpt_path)
+    state_dict = checkpoint_state(ckpt)
+    resolved_crop = resolve_crop(ckpt, ckpt_path, args.image_crop)
+    print(f"[*] Image Crop Mode: {resolved_crop} (checkpoint contract)")
+
+    print(f"\n[2/3] Loading Pi0.5 ({profile_name}) from {CHECKPOINT_DIR.name} on GPU 1 (RTX 5090)...")
+    t0 = time.perf_counter()
+    model = PI05Inference.from_checkpoint(
+        CHECKPOINT_DIR,
+        stats_path=STATS_PATH,
+        tokenizer_path=TOKENIZER_PATH,
+        device="cuda:0",
+        profile=profile_name,
+        crop_mode=resolved_crop,
+        trainable_fp32=True
+    )
+    print(f"[Model OK] Base model loaded in {time.perf_counter() - t0:.2f}s.")
+
+    print(f"[Model] Loading weights from {ckpt_path.name}...")
+    is_lora = any("lora_" in k for k in state_dict.keys())
+    if is_lora:
+        from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
+        lang_r = ckpt.get("lang_rank", 16)
+        exp_r = ckpt.get("expert_rank", 32)
+        print(f"[Model] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
+        inject_pi05_lora(model.network, **lora_spec(ckpt))
+        load_lora_state_dict(model.network, state_dict, strict=True)
+        print(f"[Model OK] LoRA Multi-Task Adapters loaded! (Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
     else:
-        print(f"[Model Warning] Checkpoint {ckpt_path} not found. Running base pre-trained weights.")
+        missing, unexpected = model.network.load_state_dict(state_dict, strict=False)
+        trainable_names = {name for name, _ in model.network.named_parameters()
+                           if any(part in name for part in ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"))}
+        missing_trainable = sorted(trainable_names.intersection(missing))
+        allowed_prefixes = ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out", "multi_modal_projector", "vision_tower")
+        unexpected_critical = [k for k in unexpected if not any(p in k for p in allowed_prefixes)]
+        if missing_trainable or unexpected_critical:
+            raise RuntimeError(f"checkpoint mismatch: missing_trainable={missing_trainable}, unexpected={unexpected_critical}")
+        has_vision = any("vision_tower" in k or "multi_modal_projector" in k for k in state_dict)
+        vision_tag = " (+Vision Tuned)" if has_vision else ""
+        print(f"[Model OK] Fine-tuned Action Expert{vision_tag} loaded! (File: {ckpt_path.name}, Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
 
     # 3. Offline Mock Benchmark Branch (if --mock specified)
     if args.mock:
@@ -387,6 +387,7 @@ def main():
                     print(f"  [RTC #{loop_cnt:03d} Warning] RealSense frames stale/missing! Sending hold chunk.")
                     resp = {
                         "type": "action_chunk",
+                        "hold": True,
                         "loop": loop_cnt,
                         "action_mode": args.profile,
                         "latency_ms": 0.0,

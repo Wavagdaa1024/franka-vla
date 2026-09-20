@@ -169,7 +169,7 @@ class TestCodexAuditFixes(unittest.TestCase):
         from sync_vla_agent import DualRealSenseStreamer
         
         streamer = DualRealSenseStreamer("MOCK_F", "MOCK_W", fps=15)
-        now = time.time()
+        now = time.monotonic()
         # Mock valid fresh frames
         streamer.frames["front"] = np.zeros((480, 640, 3), dtype=np.uint8)
         streamer.frames["wrist"] = np.zeros((480, 640, 3), dtype=np.uint8)

@@ -202,28 +202,36 @@ def extract_lora_state_dict(net: nn.Module) -> Dict[str, torch.Tensor]:
 
 
 def load_lora_state_dict(net: nn.Module, state_dict: Dict[str, torch.Tensor], strict: bool = False):
-    """
-    Loads LoRA parameters and action projection weights into net.
-    Strict mode validates both unexpected keys AND missing trainable keys.
-    """
+    """Validate before mutation; rollback if copying a staged tensor fails."""
     model_params = dict(net.named_parameters())
-    trainable_keys = {name for name, p in net.named_parameters() if p.requires_grad}
-    loaded_count = 0
-    unexpected_keys = []
-
-    for name, param in state_dict.items():
-        if name in model_params:
-            target_param = model_params[name]
-            target_param.data.copy_(param.to(device=target_param.device, dtype=target_param.dtype))
-            loaded_count += 1
-        else:
-            unexpected_keys.append(name)
-
-    if strict:
-        if unexpected_keys:
-            raise KeyError(f"[LoRA Loader] Strict check failed: {len(unexpected_keys)} unexpected keys found in state_dict! E.g.: {unexpected_keys[:5]}")
-        missing_keys = [k for k in trainable_keys if k not in state_dict]
-        if missing_keys:
-            raise KeyError(f"[LoRA Loader] Strict check failed: {len(missing_keys)} required trainable keys missing from checkpoint! E.g.: {missing_keys[:5]}")
-
-    print(f"[LoRA Loader] Successfully loaded {loaded_count}/{len(state_dict)} tensors (strict={strict}).")
+    trainable_keys = {name for name, p in model_params.items() if p.requires_grad}
+    supplied = set(state_dict)
+    allowed = trainable_keys if strict else set(model_params)
+    unexpected = supplied - allowed
+    missing = trainable_keys - supplied
+    if strict and (unexpected or missing):
+        raise KeyError(f"LoRA keys mismatch: unexpected={sorted(unexpected)[:5]}, missing={sorted(missing)[:5]}")
+    staged = {}
+    for name, tensor in state_dict.items():
+        if name not in model_params:
+            continue
+        target = model_params[name]
+        if not isinstance(tensor, torch.Tensor) or tensor.shape != target.shape:
+            raise ValueError(f"Checkpoint shape mismatch for {name}: expected {tuple(target.shape)}")
+        if not tensor.is_floating_point() or not torch.isfinite(tensor).all():
+            raise ValueError(f"Checkpoint tensor must be finite floating point: {name}")
+        staged[name] = tensor.to(device=target.device, dtype=target.dtype)
+        if not torch.isfinite(staged[name]).all():
+            raise ValueError(f"Checkpoint conversion overflow: {name}")
+    # CPU backups avoid doubling the model's GPU allocation during hot swapping.
+    backups = {name: model_params[name].detach().cpu().clone() for name in staged}
+    try:
+        with torch.no_grad():
+            for name, tensor in staged.items():
+                model_params[name].copy_(tensor)
+    except Exception:
+        with torch.no_grad():
+            for name, tensor in backups.items():
+                model_params[name].copy_(tensor)
+        raise
+    print(f"[LoRA Loader] Successfully loaded {len(staged)}/{len(state_dict)} tensors (strict={strict}).")

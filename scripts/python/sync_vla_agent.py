@@ -42,6 +42,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from franka_teleop.pi05_engine.runtime import PI05Inference
+from franka_teleop.camera_frames import validated_frame_pair
+from franka_teleop.pi05_engine.contracts import read_checkpoint, checkpoint_state, resolve_crop, lora_spec
 from franka_teleop.live_guards import validate_joint_position_chunk
 from franka_teleop.kinematics import (
     forward_kinematics,
@@ -112,7 +114,7 @@ class DualRealSenseStreamer:
                         data = np.asanyarray(cf.get_data())
                         with self.lock:
                             self.frames[role] = data
-                            self.timestamps[role] = time.time()
+                            self.timestamps[role] = time.monotonic()
                 except Exception:
                     pass
         except Exception as e:
@@ -145,21 +147,9 @@ class DualRealSenseStreamer:
         return False
 
     def get_frames(self, max_age_s: float = 0.5, max_sync_diff_s: float = 0.08):
-        """Returns the most recent synchronized RGB frames, strictly checking age and inter-camera sync."""
         with self.lock:
-            now = time.time()
-            front_valid = (self.frames["front"] is not None and (now - self.timestamps["front"]) <= max_age_s)
-            wrist_valid = (self.frames["wrist"] is not None and (now - self.timestamps["wrist"]) <= max_age_s)
-
-            if not front_valid or not wrist_valid:
-                # Stale camera detected: do NOT return stale frames!
-                return None, None
-
-            sync_diff = abs(self.timestamps["front"] - self.timestamps["wrist"])
-            if sync_diff > max_sync_diff_s:
-                print(f"[Cameras Warning] Inter-camera sync jitter: {sync_diff*1000:.1f}ms > {max_sync_diff_s*1000:.0f}ms")
-
-            return self.frames["front"].copy(), self.frames["wrist"].copy()
+            return validated_frame_pair(self.frames, self.timestamps, time.monotonic(),
+                                        max_age_s, max_sync_diff_s)
 
     def stop(self):
         self.stop_event.set()
@@ -221,7 +211,7 @@ def main():
     parser.add_argument("--flip-lr", action="store_true", default=False, help="Invert Joint 0 (base yaw)")
     parser.add_argument("--fps", type=int, default=15, help="Control loop frequency in Hz (default: 15)")
     parser.add_argument("--image-crop", type=str, choices=("auto", "16_9", "none"), default="auto",
-                        help="Image crop mode (default: auto; uses 16_9 for crop169, none for pure_flow)")
+                        help="Checkpoint crop metadata first; unknown legacy weights require an explicit mode")
     parser.add_argument("--mock", action="store_true", default=False,
                         help="Run offline mock test without connecting to real cameras or Franka controller")
     args = parser.parse_args()
@@ -289,12 +279,11 @@ def main():
             f"Refusing to execute with untrained base model to protect the robot!"
         )
 
-    # 3. Resolve Image Crop Mode (Strict Backward Compatibility)
-    if args.image_crop == "auto":
-        resolved_crop = "16_9" if "crop169" in str(ckpt_path).lower() else "none"
-    else:
-        resolved_crop = args.image_crop
-    print(f"[*] Image Crop Mode:        [{resolved_crop.upper()}] (Resolved from: {args.image_crop})")
+    # Resolve the saved contract before allocating the base network.
+    ckpt = read_checkpoint(ckpt_path)
+    state_dict = checkpoint_state(ckpt)
+    resolved_crop = resolve_crop(ckpt, ckpt_path, args.image_crop)
+    print(f"[*] Image Crop Mode: {resolved_crop} (checkpoint contract)")
 
     # 4. Load Model onto GPU 1
     CHECKPOINT_DIR = Path(args.model_dir) if args.model_dir else PROJECT_ROOT / "checkpoints" / "pi05_droid_jointpos"
@@ -317,15 +306,13 @@ def main():
 
 
     print(f"[Model] Loading weights from {ckpt_path.name}...")
-    ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)
-    state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-    is_lora = any("lora_" in k for k in state_dict.keys()) or "lora" in str(ckpt_path).lower()
+    is_lora = any("lora_" in k for k in state_dict.keys())
     if is_lora:
         from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
         lang_r = ckpt.get("lang_rank", 16)
         exp_r = ckpt.get("expert_rank", 32)
         print(f"[Model] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
-        inject_pi05_lora(model.network, lang_rank=lang_r, expert_rank=exp_r)
+        inject_pi05_lora(model.network, **lora_spec(ckpt))
         load_lora_state_dict(model.network, state_dict, strict=True)
         print(f"[Model OK] LoRA Multi-Task Adapters loaded! (Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
     else:
