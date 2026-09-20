@@ -45,6 +45,7 @@ from franka_teleop.pi05_engine.runtime import PI05Inference
 from franka_teleop.live_guards import validate_joint_position_chunk
 from franka_teleop.kinematics import (
     forward_kinematics,
+    compute_ee_tilt,
     correct_chunk_nullspace,
     DEFAULT_Z_FLOOR
 )
@@ -417,6 +418,7 @@ def main():
                     dq_fallback[s] = (q_valid[s] - q_valid[s - 1]) / dt_ctrl
 
                 p_curr = forward_kinematics(raw_q)[:3, 3]
+                tilt_curr = compute_ee_tilt(raw_q)
                 p_target = forward_kinematics(q_valid[-1])[:3, 3]
                 dp = p_target - p_curr
 
@@ -433,7 +435,8 @@ def main():
                 }
                 send_json(sock, resp)
                 clamp_str = f" | [FLOOR CLAMP x{z_clamped}]" if z_clamped > 0 else ""
-                print(f"  [Sync #{loop_cnt:03d}] Infer: {t_infer:5.1f}ms | Target Δp: [{dp[0]:+.3f}, {dp[1]:+.3f}, {dp[2]:+.3f}]m | Grip: {g_valid[0]:.2f}{clamp_str}")
+                tilt_str = f" | [TILT WARN: {tilt_curr:.1f}°]" if tilt_curr > 8.0 else f" | Tilt: {tilt_curr:.1f}°"
+                print(f"  [Sync #{loop_cnt:03d}] Infer: {t_infer:5.1f}ms | EE: [{p_curr[0]:+.3f}, {p_curr[1]:+.3f}, {p_curr[2]:+.3f}]{tilt_str} | Target Δp: [{dp[0]:+.3f}, {dp[1]:+.3f}, {dp[2]:+.3f}]m | Grip: {g_valid[0]:.2f}{clamp_str}")
 
         except (ConnectionError, OSError) as e:
             print(f"[Network] Franka disconnected: {e}. Re-waiting for connection...")

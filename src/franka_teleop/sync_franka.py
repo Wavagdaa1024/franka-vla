@@ -84,6 +84,9 @@ try:
         analytical_jacobian,
         damped_pinv,
         project_velocity_z_floor,
+        compute_ee_tilt,
+        solve_ee_recovery_joints,
+        generate_smooth_recovery_traj,
         DEFAULT_Z_FLOOR,
         FRANKA_JOINT_LIMITS
     )
@@ -93,6 +96,9 @@ except ImportError:
         analytical_jacobian,
         damped_pinv,
         project_velocity_z_floor,
+        compute_ee_tilt,
+        solve_ee_recovery_joints,
+        generate_smooth_recovery_traj,
         DEFAULT_Z_FLOOR,
         FRANKA_JOINT_LIMITS
     )
@@ -172,6 +178,67 @@ def read_gripper_normalized(arm, default=0.0):
     return float(np.clip(1.0 - float(w) / 0.08, 0.0, 1.0))
 
 
+def check_and_restore_ee_pose(arm, curr_q, args, rate):
+    """
+    Checks if end-effector pose deviates beyond safe thresholds:
+      - Tilt exceeds args.max_tilt_deg (e.g. 8.0°)
+      - Position drops below args.z_min (table floor)
+    If deviated, executes smooth restorative trajectory to return to vertical downward orientation
+    and safe height without disturbing the (X, Y) task trajectory.
+    Returns:
+      (updated_q, did_recover)
+    """
+    if not getattr(args, "recover_ee", True) or curr_q is None:
+        return curr_q, False
+
+    tilt_deg = compute_ee_tilt(curr_q)
+    T_live = forward_kinematics(curr_q)
+    p_live = T_live[:3, 3]
+
+    needs_recovery = (tilt_deg > args.max_tilt_deg) or (p_live[2] < args.z_min)
+    if not needs_recovery:
+        return curr_q, False
+
+    reasons = []
+    if tilt_deg > args.max_tilt_deg:
+        reasons.append(f"Tilt {tilt_deg:.1f}° > {args.max_tilt_deg:.1f}°")
+    if p_live[2] < args.z_min:
+        reasons.append(f"Z {p_live[2]*1000.0:.1f}mm < {args.z_min*1000.0:.1f}mm")
+    reason_str = ", ".join(reasons)
+
+    print(f"\n[POSE GUARD] OOD State Detected ({reason_str})! Restoring upright EE pose...")
+    q_target, tilt_after, pos_err = solve_ee_recovery_joints(
+        curr_q, z_floor=args.z_min, max_iters=args.recovery_iters, z_lift=0.003
+    )
+    dq_traj = generate_smooth_recovery_traj(
+        curr_q, q_target, steps=args.recovery_steps, dt=DT, max_vel=args.recovery_vel
+    )
+
+    if not args.shadow:
+        for dq_cmd in dq_traj:
+            if rospy.is_shutdown():
+                break
+            q_live = arm.get_joint_positions()
+            dq_safe, _ = project_velocity_z_floor(q_live, dq_cmd, dt=DT, z_floor=args.z_min)
+            for j in range(7):
+                if (q_live[j] + dq_safe[j] * DT) < FRANKA_JOINT_LIMITS[j][0] and dq_safe[j] < 0:
+                    dq_safe[j] = 0.0
+                elif (q_live[j] + dq_safe[j] * DT) > FRANKA_JOINT_LIMITS[j][1] and dq_safe[j] > 0:
+                    dq_safe[j] = 0.0
+            arm.set_joint_velocities(dq_safe)
+            rate.sleep()
+        arm.stop()
+        if args.settle_time > 0:
+            rospy.sleep(args.settle_time)
+    else:
+        arm.set_joint_velocities(np.zeros(7))
+
+    q_final = arm.get_joint_positions()
+    p_final = forward_kinematics(q_final)[:3, 3] if q_final is not None else p_live
+    print(f"[POSE GUARD OK] Recovery Finished: Tilt {tilt_after:.2f}° (drift {tilt_deg - tilt_after:.1f}° cleared) | EE: [{p_final[0]:+.3f}, {p_final[1]:+.3f}, {p_final[2]:+.3f}]m\n")
+    return q_final, True
+
+
 def run_sync_loop(arm, conn, args):
     """
     Pure Synchronous Stop-and-Go Closed-Loop Execution Loop.
@@ -191,6 +258,7 @@ def run_sync_loop(arm, conn, args):
     print(f"  [Config] Settling Time:    {args.settle_time * 1000:.0f} ms (Zero Motion Blur)")
     print(f"  [Config] Hard Table Floor: Z >= {args.z_min * 1000.0:.1f} mm")
     print(f"  [Config] Max Speed Clamp:  {args.max_vel:.2f} rad/s")
+    print(f"  [Config] EE Pose Recovery: {getattr(args, 'recover_ee', True)} (Max Tilt: {args.max_tilt_deg:.1f}°)")
     print("=" * 80)
 
     try:
@@ -203,9 +271,17 @@ def run_sync_loop(arm, conn, args):
             if args.settle_time > 0:
                 rospy.sleep(args.settle_time)
 
-            # 2. Sample live robot state
-            curr_pos, _ = arm.get_cartesian_pose()
+            # 2. EE Pose Guard & Recovery: Detect OOD tilt/height and restore before camera capture
             curr_q = arm.get_joint_positions()
+            if curr_q is not None and getattr(args, "recover_ee", True):
+                curr_q, did_recover = check_and_restore_ee_pose(arm, curr_q, args, rate)
+                if did_recover:
+                    prev_dq = np.zeros(7, dtype=np.float64)
+
+            # 3. Sample live in-distribution robot state
+            curr_pos, _ = arm.get_cartesian_pose()
+            if curr_q is None:
+                curr_q = arm.get_joint_positions()
             if curr_pos is None or curr_q is None:
                 rospy.sleep(0.02)
                 continue
@@ -258,23 +334,22 @@ def run_sync_loop(arm, conn, args):
                     pos_err = q_des - curr_q_live
                     dq_target = args.kp_pos * pos_err
 
-                    # Real-time closed-loop vertical orientation locking in position nullspace (ablation only)
-                    if args.enable_nullspace:
-                        z_live = forward_kinematics(curr_q_live)[:3, 2]
-                        w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
-                        if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
-                            J = analytical_jacobian(curr_q_live)
-                            J_v = J[:3, :]
-                            J_w = J[3:, :]
-                            J_v_pinv = damped_pinv(J_v, damping=1e-4)
-                            N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
-                            J_w_null = J_w @ N_v
-                            J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
-                            dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
-                            dq_orient_norm = np.linalg.norm(dq_orient)
-                            if dq_orient_norm > 0.15:
-                                dq_orient = dq_orient * (0.15 / dq_orient_norm)
-                            dq_target += dq_orient
+                    # Real-time closed-loop vertical orientation locking in position nullspace
+                    z_live = forward_kinematics(curr_q_live)[:3, 2]
+                    w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
+                    if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
+                        J = analytical_jacobian(curr_q_live)
+                        J_v = J[:3, :]
+                        J_w = J[3:, :]
+                        J_v_pinv = damped_pinv(J_v, damping=1e-4)
+                        N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
+                        J_w_null = J_w @ N_v
+                        J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
+                        dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
+                        dq_orient_norm = np.linalg.norm(dq_orient)
+                        if dq_orient_norm > 0.15:
+                            dq_orient = dq_orient * (0.15 / dq_orient_norm)
+                        dq_target += dq_orient
                 else:
                     dq_target = np.array(vels[step], dtype=np.float64)
 
@@ -361,7 +436,7 @@ def main():
     parser = argparse.ArgumentParser(description="Franka Synchronous (Stop-and-Go) VLA Execution Service")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Listening port (default: 8765)")
     parser.add_argument("--sync-steps", type=int, default=DEFAULT_SYNC_STEPS,
-                        help="Steps per cycle in sync mode (default: 6, ~0.4s motion)")
+                        help=f"Steps per cycle in sync mode (default: {DEFAULT_SYNC_STEPS})")
     parser.add_argument("--settle-time", type=float, default=0.05,
                         help="Stationary settling time before camera capture (default: 0.05s)")
     parser.add_argument("--max-vel", type=float, default=MAX_JOINT_VEL,
@@ -372,6 +447,18 @@ def main():
                         help=f"Minimum safe table Z height in meters (default: {DEFAULT_Z_FLOOR}m = +7.0mm)")
     parser.add_argument("--kp-pos", type=float, default=8.0,
                         help="P-servo tracking gain for joint position mode (default: 8.0)")
+    parser.add_argument("--max-tilt-deg", type=float, default=8.0,
+                        help="Max allowable gripper tilt from vertical downward in degrees (default: 8.0)")
+    parser.add_argument("--recover-ee", dest="recover_ee", action="store_true", default=True,
+                        help="Enable automatic end-effector pose recovery when tilt/height limits exceeded (default: True)")
+    parser.add_argument("--no-recover-ee", dest="recover_ee", action="store_false",
+                        help="Disable automatic end-effector pose recovery")
+    parser.add_argument("--recovery-steps", type=int, default=10,
+                        help="Number of steps for smooth recovery trajectory (default: 10 @ 15Hz = 0.67s)")
+    parser.add_argument("--recovery-vel", type=float, default=0.20,
+                        help="Max joint velocity clamp during pose recovery in rad/s (default: 0.20)")
+    parser.add_argument("--recovery-iters", type=int, default=25,
+                        help="Max Newton-Raphson IK solver iterations for recovery (default: 25)")
     parser.add_argument("--close-delay-steps", type=int, default=2,
                         help="Debounce steps before closing gripper (default: 2)")
     parser.add_argument("--flip-lr", action="store_true", default=False,
@@ -393,6 +480,7 @@ def main():
     print(f"[*] Hard Table Floor:  Z >= {args.z_min * 1000.0:.1f} mm")
     print(f"[*] Max Speed:         {args.max_vel:.2f} rad/s")
     print(f"[*] Max Accel:         {args.max_acc:.2f} rad/s^2")
+    print(f"[*] Pose Recovery:     {args.recover_ee} (Max Tilt: {args.max_tilt_deg:.1f}°, Max RecVel: {args.recovery_vel:.2f} rad/s)")
     print(f"[*] Shadow Mode:       {args.shadow}")
     print("-" * 80)
 

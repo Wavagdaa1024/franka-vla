@@ -70,7 +70,7 @@ python3 sync_franka.py --z-min 0.0070
 ```cmd
 cd C:\Users\74727\Desktop\project\VLA_franka
 
-:: 启动同步推理 Agent (自动隔离 GPU 1: RTX 5090 32GB)
+# 启动同步推理 Agent (自动隔离 GPU 1: RTX 5090 32GB)
 .\scripts\run_sync_agent.bat --task "pick and place the red cube"
 ```
 

@@ -240,6 +240,90 @@ def lock_gripper_vertical_downward(
     return q, tilt_deg
 
 
+def compute_ee_tilt(q: np.ndarray) -> float:
+    """
+    Computes end-effector tool Z-axis tilt angle in degrees relative to vertical downward [0, 0, -1].
+    0.0 deg indicates tool Z-axis is strictly pointing down.
+    """
+    T = forward_kinematics(np.asarray(q, dtype=np.float64))
+    z_ee = T[:3, 2]
+    cos_tilt = np.clip(np.dot(z_ee, [0.0, 0.0, -1.0]), -1.0, 1.0)
+    return float(np.arccos(cos_tilt) * 180.0 / np.pi)
+
+
+def solve_ee_recovery_joints(
+    curr_q: np.ndarray,
+    z_floor: float = DEFAULT_Z_FLOOR,
+    max_iters: int = 25,
+    z_lift: float = 0.003
+) -> Tuple[np.ndarray, float, float]:
+    """
+    Computes safe restorative joint positions to recover vertical downward end-effector pose:
+      - Preserves current (X, Y) task position so the arm does not deviate from target object.
+      - Guarantees Z >= z_floor (if Z < z_floor, lifts Z to z_floor + z_lift).
+      - Locks tool Z-axis strictly vertical downward [0, 0, -1] (Roll=0, Pitch=0).
+    Returns:
+      (q_restored, residual_tilt_deg, pos_err_m)
+    """
+    curr_q = np.asarray(curr_q, dtype=np.float64)
+    T_curr = forward_kinematics(curr_q)
+    target_pos = T_curr[:3, 3].copy()
+
+    # Position target: preserve (x, y), guarantee z >= z_floor
+    if target_pos[2] < z_floor:
+        target_pos[2] = z_floor + z_lift
+
+    q_rec, tilt_deg = lock_gripper_vertical_downward(
+        curr_q, target_pos, max_iters=max_iters, tol_pos=5e-5, tol_rot=1e-4, damping=1e-3
+    )
+    p_rec = forward_kinematics(q_rec)[:3, 3]
+    pos_err = float(np.linalg.norm(p_rec - target_pos))
+    return q_rec, tilt_deg, pos_err
+
+
+def generate_smooth_recovery_traj(
+    q_start: np.ndarray,
+    q_target: np.ndarray,
+    steps: int = 10,
+    dt: float = 0.0667,
+    max_vel: float = 0.20
+) -> np.ndarray:
+    """
+    Generates a C1-smooth joint velocity trajectory (dq_steps) to transition from q_start to q_target.
+    Uses half-cosine (minimum jerk) profile with zero velocity at start and end.
+    Clamps peak joint velocity to max_vel (rad/s).
+    Returns:
+      dq_traj: (steps, 7) array of velocity commands
+    """
+    q_start = np.asarray(q_start, dtype=np.float64)
+    q_target = np.asarray(q_target, dtype=np.float64)
+    delta_q = q_target - q_start
+
+    # If already at target, return zero velocities
+    if np.linalg.norm(delta_q) < 1e-5 or steps <= 1:
+        return np.zeros((steps, 7), dtype=np.float64)
+
+    # Minimum steps needed to respect max_vel
+    # Peak velocity in half-cosine profile: v_peak = (delta_q * pi) / (2 * total_time)
+    max_dq_elem = float(np.max(np.abs(delta_q)))
+    req_time = (max_dq_elem * np.pi) / (2.0 * max_vel) if max_vel > 0 else 0.0
+    req_steps = int(np.ceil(req_time / dt))
+    actual_steps = max(steps, req_steps)
+
+    # Generate smooth S-curve waypoints: s(t) = 0.5 * (1 - cos(pi * (i + 1) / actual_steps))
+    dq_list = []
+    q_prev = q_start.copy()
+    for i in range(actual_steps):
+        s_frac = 0.5 * (1.0 - np.cos(np.pi * (i + 1) / float(actual_steps)))
+        q_cur = q_start + s_frac * delta_q
+        dq = (q_cur - q_prev) / dt
+        dq_clamped = np.clip(dq, -max_vel, max_vel)
+        dq_list.append(dq_clamped)
+        q_prev = q_cur
+
+    return np.array(dq_list, dtype=np.float64)
+
+
 def correct_chunk_nullspace(
     current_q: np.ndarray,
     chunk_q: np.ndarray,
