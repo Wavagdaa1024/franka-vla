@@ -255,37 +255,59 @@ def main():
 
     # Resolve Checkpoint
     ckpt_key = str(args.checkpoint).strip().lower()
+    pure_flow_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k"
+    
+    ckpt_path = None
     if ckpt_key in CKPT_ALIASES:
         ckpt_path = CKPT_ALIASES[ckpt_key]
+    elif Path(args.checkpoint).exists():
+        ckpt_path = Path(args.checkpoint)
+    elif (pure_flow_dir / args.checkpoint).exists():
+        ckpt_path = pure_flow_dir / args.checkpoint
+    elif (pure_flow_dir / f"{args.checkpoint}.pt").exists():
+        ckpt_path = pure_flow_dir / f"{args.checkpoint}.pt"
+    elif (PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint).exists():
+        ckpt_path = PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint
     else:
-        p = Path(args.checkpoint)
-        ckpt_path = p if p.exists() else (PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint)
+        # Try step_XXXXX matching
+        clean_name = args.checkpoint.replace("step_", "").replace(".pt", "").strip()
+        if clean_name.isdigit():
+            step_num = int(clean_name)
+            candidate = pure_flow_dir / f"step_{step_num:05d}.pt"
+            if candidate.exists():
+                ckpt_path = candidate
 
-    if ckpt_path and ckpt_path.exists():
-        print(f"[Model] Loading weights from {ckpt_path.name}...")
-        ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)
-        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
-        is_lora = any("lora_" in k for k in state_dict.keys()) or "lora" in str(ckpt_path).lower()
-        if is_lora:
-            from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
-            lang_r = ckpt.get("lang_rank", 16)
-            exp_r = ckpt.get("expert_rank", 32)
-            print(f"[Model] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
-            inject_pi05_lora(model.network, lang_rank=lang_r, expert_rank=exp_r)
-            load_lora_state_dict(model.network, state_dict, strict=True)
-            print(f"[Model OK] LoRA Multi-Task Adapters loaded! (Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
-        else:
-            missing, unexpected = model.network.load_state_dict(state_dict, strict=False)
-            trainable_names = {name for name, _ in model.network.named_parameters()
-                               if any(part in name for part in ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"))}
-            missing_trainable = sorted(trainable_names.intersection(missing))
-            allowed_prefixes = ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out", "multi_modal_projector", "vision_tower")
-            unexpected_critical = [k for k in unexpected if not any(p in k for p in allowed_prefixes)]
-            if missing_trainable or unexpected_critical:
-                raise RuntimeError(f"checkpoint mismatch: missing_trainable={missing_trainable}, unexpected={unexpected_critical}")
-            print(f"[Model OK] Fine-tuned weights loaded cleanly! (File: {ckpt_path.name})")
+    if not ckpt_path or not ckpt_path.exists():
+        available_ckpts = sorted([f.name for f in pure_flow_dir.glob("*.pt")]) if pure_flow_dir.exists() else []
+        raise FileNotFoundError(
+            f"\n[FATAL ERROR] Checkpoint '{args.checkpoint}' was NOT found!\n"
+            f"Available checkpoints in outputs/checkpoints/pi05_lora_pure_flow_50k:\n"
+            f"  {', '.join(available_ckpts)}\n"
+            f"Refusing to execute with untrained base model to protect the robot!"
+        )
+
+    print(f"[Model] Loading weights from {ckpt_path.name}...")
+    ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)
+    state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+    is_lora = any("lora_" in k for k in state_dict.keys()) or "lora" in str(ckpt_path).lower()
+    if is_lora:
+        from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
+        lang_r = ckpt.get("lang_rank", 16)
+        exp_r = ckpt.get("expert_rank", 32)
+        print(f"[Model] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
+        inject_pi05_lora(model.network, lang_rank=lang_r, expert_rank=exp_r)
+        load_lora_state_dict(model.network, state_dict, strict=True)
+        print(f"[Model OK] LoRA Multi-Task Adapters loaded! (Step: {ckpt.get('step', '?')}, Loss: {ckpt.get('loss', 0.0):.4f})")
     else:
-        print(f"[Model Warning] Checkpoint {ckpt_path} not found. Running base pre-trained weights.")
+        missing, unexpected = model.network.load_state_dict(state_dict, strict=False)
+        trainable_names = {name for name, _ in model.network.named_parameters()
+                           if any(part in name for part in ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"))}
+        missing_trainable = sorted(trainable_names.intersection(missing))
+        allowed_prefixes = ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out", "multi_modal_projector", "vision_tower")
+        unexpected_critical = [k for k in unexpected if not any(p in k for p in allowed_prefixes)]
+        if missing_trainable or unexpected_critical:
+            raise RuntimeError(f"checkpoint mismatch: missing_trainable={missing_trainable}, unexpected={unexpected_critical}")
+        print(f"[Model OK] Fine-tuned weights loaded cleanly! (File: {ckpt_path.name})")
 
     # 3. Offline Mock Benchmark Branch (if --mock specified)
     if args.mock:
