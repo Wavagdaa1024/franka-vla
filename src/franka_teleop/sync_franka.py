@@ -258,22 +258,23 @@ def run_sync_loop(arm, conn, args):
                     pos_err = q_des - curr_q_live
                     dq_target = args.kp_pos * pos_err
 
-                    # Real-time closed-loop vertical orientation locking in position nullspace
-                    z_live = forward_kinematics(curr_q_live)[:3, 2]
-                    w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
-                    if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
-                        J = analytical_jacobian(curr_q_live)
-                        J_v = J[:3, :]
-                        J_w = J[3:, :]
-                        J_v_pinv = damped_pinv(J_v, damping=1e-4)
-                        N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
-                        J_w_null = J_w @ N_v
-                        J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
-                        dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
-                        dq_orient_norm = np.linalg.norm(dq_orient)
-                        if dq_orient_norm > 0.15:
-                            dq_orient = dq_orient * (0.15 / dq_orient_norm)
-                        dq_target += dq_orient
+                    # Real-time closed-loop vertical orientation locking in position nullspace (ablation only)
+                    if args.enable_nullspace:
+                        z_live = forward_kinematics(curr_q_live)[:3, 2]
+                        w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
+                        if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
+                            J = analytical_jacobian(curr_q_live)
+                            J_v = J[:3, :]
+                            J_w = J[3:, :]
+                            J_v_pinv = damped_pinv(J_v, damping=1e-4)
+                            N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
+                            J_w_null = J_w @ N_v
+                            J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
+                            dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
+                            dq_orient_norm = np.linalg.norm(dq_orient)
+                            if dq_orient_norm > 0.15:
+                                dq_orient = dq_orient * (0.15 / dq_orient_norm)
+                            dq_target += dq_orient
                 else:
                     dq_target = np.array(vels[step], dtype=np.float64)
 
@@ -375,6 +376,8 @@ def main():
                         help="Debounce steps before closing gripper (default: 2)")
     parser.add_argument("--flip-lr", action="store_true", default=False,
                         help="Invert Joint 0 (base yaw)")
+    parser.add_argument("--enable-nullspace", action="store_true", default=False,
+                        help="Enable artificial vertical orientation locking in nullspace (ablation only, default: False)")
     parser.add_argument("--shadow", action="store_true", default=False,
                         help="Shadow mode: log commands without moving physical robot")
     args = parser.parse_args()

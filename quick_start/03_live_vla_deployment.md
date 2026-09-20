@@ -2,6 +2,21 @@
 
 本教程指导如何将训练好的 VLA 模型（50,000 步纯净流匹配 Pi0.5 LoRA 模型）接入实机 Franka 机械臂，进行闭环自主推理与抓取控制。
 
+为满足不同实验场景需求，系统已将**同步推理 (Stop-and-Go)** 与 **异步推理 (RTC 连续流)** 彻底解耦为两个独立程序，分别拥有独立的运行入口与参数配置。
+
+---
+
+## 模式选择指南
+
+| 特性维度 | 方案 A：同步推理 (Stop-and-Go) 【推荐首选】 | 方案 B：异步推理 (RTC 连续流) |
+| :--- | :--- | :--- |
+| **运行脚本 (Windows)** | `scripts\run_sync_agent.bat` | `scripts\run_async_agent.bat` |
+| **服务程序 (Linux)** | `src/franka_teleop/sync_franka.py` | `src/franka_teleop/closed_loop_franka.py --rtc` |
+| **动作衔接** | 执行完 15 步后平滑停稳 50ms 再采样 | 边走边预取下一动作分块 |
+| **控制权冲突** | **零冲突**（起步位置与当前真实位置 100% 吻合） | 若时延预估偏差易产生反向拉扯 |
+| **视觉清晰度** | **零运动模糊**（静止采样，抓取定位极准） | 高速运动时可能存在局部模糊 |
+| **推荐适用场景** | **精细抓取、防打架调试、稳定可靠部署** | **大范围自由流动探索、高帧率连续推流** |
+
 ---
 
 ## 第 1 步：在 Franka Linux 终端启动底层关节速度控制器
@@ -20,56 +35,67 @@ roslaunch franka_example_controllers joint_velocity_example_controller.launch ro
 
 ---
 
-## 第 2 步：在 Franka 新终端启动闭环执行服务
+## 第 2 步：在 Franka 新终端启动执行服务（二选一）
 
-新开一个 Franka 终端 2，运行：
+新开一个 Franka 终端 2，进入代码目录：
 ```bash
 source /opt/ros/noetic/setup.bash
 cd /home/ssui/project/embodied_midterm/controller_lerobot
-
-# 启动 RTC (Real-Time Chunking) 连续流式闭环服务 (带桌面 Z>=7.0mm 安全门禁)
-python3 closed_loop_franka_server.py --rtc --z-min 0.0070
 ```
-*(如果是排查测试，亦可使用传统步进模式：`python3 closed_loop_franka_server.py --sync --sync-steps 15`)*
 
-*(终端将打印机械臂当前关节就绪状态，并等待 Windows 端 Agent 建立 TCP 连接)*
+### 【推荐首选】方案 A：启动同步执行服务 (Stop-and-Go)
+彻底消除“抢控制权”与拉扯抖动，停稳 50ms 静态采样相机画面，纯净执行 50k 模型的原生 7-DOF 轨迹：
+```bash
+python3 src/franka_teleop/sync_franka.py --z-min 0.0070
+```
+- `--z-min 0.0070`：硬编码桌面安全底面（$Z \ge +7.0\text{ mm}$）。
+- `--settle-time 0.05`：每个分块执行完毕后停稳 50ms 供相机无模糊采图（默认已启用）。
+- 姿态控制：默认不开启任何人工竖直强加，完全由 50k 模型自主掌握位姿。
+
+### 方案 B：启动异步连续流服务 (RTC)
+适用于高速连续流水线：
+```bash
+python3 src/franka_teleop/closed_loop_franka.py --rtc --z-min 0.0070
+```
 
 ---
 
 ## 第 3 步：在 Windows GPU 服务器启动 VLA 推理
 
 在 Windows 端打开 CMD 或 PowerShell，进入工程根目录：
-
 ```cmd
-cd /d C:\Users\74727\Desktop\project\VLA_franka
+cd C:\Users\74727\Desktop\project\VLA_franka
 ```
 
-### 方式 1：推荐首选 —— 闭环实时推理 Agent（`run_agent.bat`）
-直接与 Franka 控制机建立 TCP 流式握手，双 RealSense 相机 15Hz 实时推流，执行 50k 纯净流匹配模型预测的原生 7-DOF 轨迹：
+### 【推荐首选】方案 A：运行同步推理 Agent（`run_sync_agent.bat`）
+与 Linux 端 `sync_franka.py` 建立 1:1 请求响应式连接，杜绝时钟漂移与位置差拉扯：
 ```cmd
-.\scripts\run_agent.bat --task "pick and place the red cube"
+.\scripts\run_sync_agent.bat --task "pick and place the red cube"
 ```
-- **默认权重**：自动加载 `outputs\checkpoints\pi05_lora_pure_flow_50k\latest.pt`（50,000 步权重）。
-- **默认姿态控制**：原生 7-DOF 轨迹执行，零生硬后处理，完美释放机械臂 6-DoF 空间位姿灵活性。
-- **安全保障**：实时硬地面碰撞保护（$Z \ge +7.0\text{ mm}$）。
-
-#### 可选姿态调节参数：
-- `--enable-nullspace`：开启任务优先级零空间姿态自稳（在不改变末端 XYZ 轨迹的前提下纠偏倾角）。
-- `--lock-vertical`：强制 5-DOF 竖直向下几何锁定（消融对比用）。
-- `--checkpoint <别名/路径>`：切换不同迭代步数快照（如 `--checkpoint pure_flow_2500`）。
+- **默认权重**：自动加载 `outputs\checkpoints\pi05_lora_pure_flow_50k\latest.pt`（50,000 步纯净流匹配最优权重）。
+- **默认姿态**：原生 7-DOF 自由位姿，不强制竖直，杜绝人工控制器与模型角力。
+- **离线 Mock 快速自检**：
+  ```cmd
+  .\scripts\run_sync_agent.bat --mock
+  ```
+  *(验证模型、显卡 GPU 1 与推理速度，正常耗时 ~350ms)*
 
 ---
 
-### 方式 2：高性能 HTTP REST 推理微服务（`launch_server.bat`）
-提供轻量零依赖高吞吐 HTTP 服务，适用于多客户端接入、跨机器远程推理或离线压测：
+### 方案 B：运行异步 RTC 推理 Agent（`run_async_agent.bat`）
+与 Linux 端 `closed_loop_franka.py --rtc` 建立异步流水线连接：
+```cmd
+.\scripts\run_async_agent.bat --task "pick and place the red cube"
+```
+
+---
+
+### 方案 C：高性能 HTTP REST 推理微服务（`launch_server.bat`）
+提供轻量零依赖高吞吐 HTTP 服务，适用于多客户端接入或浏览器 Web 控制台压测：
 ```cmd
 .\scripts\launch_server.bat 8088 pure_flow
 ```
-- **Web 可视化控制台**：浏览器直接访问 [http://localhost:8088/ui](http://localhost:8088/ui)，支持实时显存监测与单步触发测试。
-- **核心 API 接口**：
-  - `POST /predict`：接收 Base64 双摄图 + 8D 关节状态，返回 15 步动作分块（实测纯 GPU 推理 ~350ms）。
-  - `GET /health`：返回显存占用率、健康指标与当前加载的权重信息。
-  - `POST /switch_checkpoint`：微秒级无缝热重载 LoRA 权重，无需重启 4.14B 基座模型。
+- **Web 可视化控制台**：浏览器直接访问 [http://localhost:8088/ui](http://localhost:8088/ui)。
 - **客户端一键回归验证**：
   ```cmd
   C:\Users\74727\miniconda3\envs\lerobot\python.exe scripts\python\test_vla_client.py http://127.0.0.1:8088
@@ -77,18 +103,9 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
 
 ---
 
-### 方式 3：离线 Mock 自检模式（不连相机与机械臂）
-在不连真实相机和机械臂的情况下，一键验证模型加载、LoRA 挂载、前向推理及算力时延：
-```cmd
-.\scripts\run_agent.bat --mock
-```
-- 预期输出 `[MOCK TEST PASSED] Steady-state Latency: ~353ms (~2.8 FPS)`，确认无误后即可连线实机。
-
----
-
 ### 💡 常用检查点 (Checkpoints) 别名速查
 
-`--checkpoint` 参数既支持直接传文件绝对路径，也支持传入以下内置快捷别名：
+`--checkpoint` 参数支持以下快捷别名：
 
 | 别名 | 对应检查点文件 | 说明 |
 | :--- | :--- | :--- |
@@ -96,8 +113,6 @@ cd /d C:\Users\74727\Desktop\project\VLA_franka
 | `pure_flow_50k` | `outputs/.../pi05_lora_pure_flow_50k/step_50000.pt` | 50,000 步终态检查点 |
 | `pure_flow_2500` | `outputs/.../pi05_lora_pure_flow_50k/step_02500.pt` | 2,500 步中期检查点 |
 | `cartesian_7d` | `outputs/.../pi05_lora_cartesian_7d/pi05_lora_multitask_step_2000.pt` | 历史消融试验模型 |
-
-> **提示**：随时运行 `.\scripts\list_ckpts.bat`，可查看磁盘上所有检查点大小、步数与 LoRA 配置。
 
 ---
 
