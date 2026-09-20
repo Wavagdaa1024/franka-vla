@@ -61,6 +61,11 @@ DEFAULT_LORA_CKPT = DEFAULT_50K_PURE_FLOW if DEFAULT_50K_PURE_FLOW.exists() else
 )
 
 CKPT_ALIASES = {
+    # 20k Pure Flow Matching with Northwestern 16:9 Center Crop
+    "crop169": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k" / "latest.pt",
+    "crop169_20k": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k" / "latest.pt",
+    "20k": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k" / "latest.pt",
+    "step_20000.pt": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k" / "step_20000.pt",
     # Pure 8D Joint Flow Matching (Canonical 50k Training)
     "pure_flow": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
     "pure_flow_latest": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
@@ -71,6 +76,7 @@ CKPT_ALIASES = {
     "cartesian_7d": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_2000.pt",
     "red_cube": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_red_cube" / "pi05_lora_multitask_step_1500.pt",
 }
+
 
 
 class DualRealSenseStreamer:
@@ -138,18 +144,22 @@ class DualRealSenseStreamer:
         print("[Cameras Warning] Warmup timeout, continuing with available frames.")
         return False
 
-    def get_frames(self, max_age_s: float = 0.5):
-        """Returns the most recent synchronized RGB frames, resilient to USB jitter."""
+    def get_frames(self, max_age_s: float = 0.5, max_sync_diff_s: float = 0.08):
+        """Returns the most recent synchronized RGB frames, strictly checking age and inter-camera sync."""
         with self.lock:
             now = time.time()
-            if self.frames["front"] is not None and (now - self.timestamps["front"]) <= max_age_s:
-                self.last_valid_frames["front"] = self.frames["front"]
-            if self.frames["wrist"] is not None and (now - self.timestamps["wrist"]) <= max_age_s:
-                self.last_valid_frames["wrist"] = self.frames["wrist"]
+            front_valid = (self.frames["front"] is not None and (now - self.timestamps["front"]) <= max_age_s)
+            wrist_valid = (self.frames["wrist"] is not None and (now - self.timestamps["wrist"]) <= max_age_s)
 
-            if self.last_valid_frames["front"] is not None and self.last_valid_frames["wrist"] is not None:
-                return self.last_valid_frames["front"].copy(), self.last_valid_frames["wrist"].copy()
-            return None, None
+            if not front_valid or not wrist_valid:
+                # Stale camera detected: do NOT return stale frames!
+                return None, None
+
+            sync_diff = abs(self.timestamps["front"] - self.timestamps["wrist"])
+            if sync_diff > max_sync_diff_s:
+                print(f"[Cameras Warning] Inter-camera sync jitter: {sync_diff*1000:.1f}ms > {max_sync_diff_s*1000:.0f}ms")
+
+            return self.frames["front"].copy(), self.frames["wrist"].copy()
 
     def stop(self):
         self.stop_event.set()
@@ -210,6 +220,8 @@ def main():
     parser.add_argument("--kp-rot", type=float, default=5.0, help="Nullspace orientation gain (default: 5.0)")
     parser.add_argument("--flip-lr", action="store_true", default=False, help="Invert Joint 0 (base yaw)")
     parser.add_argument("--fps", type=int, default=15, help="Control loop frequency in Hz (default: 15)")
+    parser.add_argument("--image-crop", type=str, choices=("auto", "16_9", "none"), default="auto",
+                        help="Image crop mode (default: auto; uses 16_9 for crop169, none for pure_flow)")
     parser.add_argument("--mock", action="store_true", default=False,
                         help="Run offline mock test without connecting to real cameras or Franka controller")
     args = parser.parse_args()
@@ -236,7 +248,55 @@ def main():
     else:
         print("\n[1/3] Mock Mode Active: Skipping RealSense physical cameras initialization.")
 
-    # 2. Load Model onto GPU 1
+    # 2. Resolve Checkpoint First
+    ckpt_key = str(args.checkpoint).strip().lower()
+    crop169_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k"
+    pure_flow_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k"
+    
+    ckpt_path = None
+    if ckpt_key in CKPT_ALIASES:
+        ckpt_path = CKPT_ALIASES[ckpt_key]
+    elif Path(args.checkpoint).exists():
+        ckpt_path = Path(args.checkpoint)
+    elif (crop169_dir / args.checkpoint).exists():
+        ckpt_path = crop169_dir / args.checkpoint
+    elif (crop169_dir / f"{args.checkpoint}.pt").exists():
+        ckpt_path = crop169_dir / f"{args.checkpoint}.pt"
+    elif (pure_flow_dir / args.checkpoint).exists():
+        ckpt_path = pure_flow_dir / args.checkpoint
+    elif (pure_flow_dir / f"{args.checkpoint}.pt").exists():
+        ckpt_path = pure_flow_dir / f"{args.checkpoint}.pt"
+    elif (PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint).exists():
+        ckpt_path = PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint
+    else:
+        # Try step_XXXXX matching in crop169 first, then pure_flow
+        clean_name = args.checkpoint.replace("step_", "").replace(".pt", "").strip()
+        if clean_name.isdigit():
+            step_num = int(clean_name)
+            for search_dir in (crop169_dir, pure_flow_dir):
+                candidate = search_dir / f"step_{step_num:05d}.pt"
+                if candidate.exists():
+                    ckpt_path = candidate
+                    break
+
+    if not ckpt_path or not ckpt_path.exists():
+        crop_ckpts = sorted([f.name for f in crop169_dir.glob("*.pt")]) if crop169_dir.exists() else []
+        flow_ckpts = sorted([f.name for f in pure_flow_dir.glob("*.pt")]) if pure_flow_dir.exists() else []
+        raise FileNotFoundError(
+            f"\n[FATAL ERROR] Checkpoint '{args.checkpoint}' was NOT found!\n"
+            f"Available checkpoints in outputs/checkpoints/pi05_lora_crop169_20k: {', '.join(crop_ckpts)}\n"
+            f"Available checkpoints in outputs/checkpoints/pi05_lora_pure_flow_50k: {', '.join(flow_ckpts)}\n"
+            f"Refusing to execute with untrained base model to protect the robot!"
+        )
+
+    # 3. Resolve Image Crop Mode (Strict Backward Compatibility)
+    if args.image_crop == "auto":
+        resolved_crop = "16_9" if "crop169" in str(ckpt_path).lower() else "none"
+    else:
+        resolved_crop = args.image_crop
+    print(f"[*] Image Crop Mode:        [{resolved_crop.upper()}] (Resolved from: {args.image_crop})")
+
+    # 4. Load Model onto GPU 1
     CHECKPOINT_DIR = Path(args.model_dir) if args.model_dir else PROJECT_ROOT / "checkpoints" / "pi05_droid_jointpos"
     STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_jointpos_norm_stats.json"
     TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
@@ -249,42 +309,12 @@ def main():
         stats_path=STATS_PATH,
         tokenizer_path=TOKENIZER_PATH,
         device="cuda:0",
-        profile=profile_name
+        profile=profile_name,
+        crop_mode=resolved_crop,
+        trainable_fp32=True
     )
     print(f"[Model OK] Base model loaded in {time.perf_counter() - t0:.2f}s.")
 
-    # Resolve Checkpoint
-    ckpt_key = str(args.checkpoint).strip().lower()
-    pure_flow_dir = PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k"
-    
-    ckpt_path = None
-    if ckpt_key in CKPT_ALIASES:
-        ckpt_path = CKPT_ALIASES[ckpt_key]
-    elif Path(args.checkpoint).exists():
-        ckpt_path = Path(args.checkpoint)
-    elif (pure_flow_dir / args.checkpoint).exists():
-        ckpt_path = pure_flow_dir / args.checkpoint
-    elif (pure_flow_dir / f"{args.checkpoint}.pt").exists():
-        ckpt_path = pure_flow_dir / f"{args.checkpoint}.pt"
-    elif (PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint).exists():
-        ckpt_path = PROJECT_ROOT / "outputs" / "checkpoints" / args.checkpoint
-    else:
-        # Try step_XXXXX matching
-        clean_name = args.checkpoint.replace("step_", "").replace(".pt", "").strip()
-        if clean_name.isdigit():
-            step_num = int(clean_name)
-            candidate = pure_flow_dir / f"step_{step_num:05d}.pt"
-            if candidate.exists():
-                ckpt_path = candidate
-
-    if not ckpt_path or not ckpt_path.exists():
-        available_ckpts = sorted([f.name for f in pure_flow_dir.glob("*.pt")]) if pure_flow_dir.exists() else []
-        raise FileNotFoundError(
-            f"\n[FATAL ERROR] Checkpoint '{args.checkpoint}' was NOT found!\n"
-            f"Available checkpoints in outputs/checkpoints/pi05_lora_pure_flow_50k:\n"
-            f"  {', '.join(available_ckpts)}\n"
-            f"Refusing to execute with untrained base model to protect the robot!"
-        )
 
     print(f"[Model] Loading weights from {ckpt_path.name}...")
     ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)

@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from .config import PI05Config
-from .utils import resize_with_pad_torch
+from .utils import resize_with_pad_torch, crop_to_16_9_torch
 
 
 def transform(tensor, stats, mode, *, inverse=False, eps=1e-8):
@@ -67,8 +67,9 @@ class PreparedInput:
 
 
 class PI05Processor:
-    def __init__(self, config: PI05Config, stats: dict, tokenizer, *, profile="checkpoint"):
+    def __init__(self, config: PI05Config, stats: dict, tokenizer, *, profile="checkpoint", crop_mode="none"):
         self.config, self.stats, self.tokenizer = config, stats, tokenizer
+        self.crop_mode = crop_mode
         if profile not in {"checkpoint", "droid", "droid_jointpos"}:
             raise ValueError("profile must be checkpoint, droid, or droid_jointpos")
         self.profile = profile
@@ -111,7 +112,7 @@ class PI05Processor:
         return q_curr + deltas
 
     @classmethod
-    def from_local(cls, config, stats_path, tokenizer_path, *, profile="checkpoint"):
+    def from_local(cls, config, stats_path, tokenizer_path, *, profile="checkpoint", crop_mode="none"):
         stats_file = Path(stats_path)
         tokenizer_dir = Path(tokenizer_path)
         if not stats_file.is_file():
@@ -127,7 +128,7 @@ class PI05Processor:
         stats = json.loads(stats_file.read_text(encoding="utf-8"))
         if "norm_stats" in stats:
             stats = {"observation.state": stats["norm_stats"]["state"], "action": stats["norm_stats"]["actions"]}
-        return cls(config, stats, tokenizer, profile=profile)
+        return cls(config, stats, tokenizer, profile=profile, crop_mode=crop_mode)
 
     def prepare_state(self, raw_state):
         state = torch.as_tensor(raw_state, dtype=torch.float32, device="cpu")
@@ -168,6 +169,8 @@ class PI05Processor:
                 raise ValueError("floating RGB must be finite and in [0,1]")
             image = image.permute(0, 2, 3, 1)
             if tuple(image.shape[1:3]) != self.config.image_resolution:
+                if getattr(self, "crop_mode", "none") == "16_9":
+                    image = crop_to_16_9_torch(image)
                 image = resize_with_pad_torch(image, *self.config.image_resolution)
             images.append((image * 2 - 1).permute(0, 3, 1, 2).contiguous())
             masks.append(torch.ones(len(state), dtype=torch.bool, device=device))

@@ -342,21 +342,23 @@ def run_sync_loop(arm, conn, args):
                     dq_target = args.kp_pos * pos_err
 
                     # Real-time closed-loop 3-DOF orientation locking in position nullspace (Roll, Pitch, Yaw)
-                    R_live = forward_kinematics(curr_q_live)[:3, :3]
-                    w_rot = compute_so3_error_vector(R_live, DEFAULT_EE_ORIENTATION)
-                    if np.linalg.norm(w_rot) > 0.008:  # > 0.5 deg SO(3) 3D error
-                        J = analytical_jacobian(curr_q_live)
-                        J_v = J[:3, :]
-                        J_w = J[3:, :]
-                        J_v_pinv = damped_pinv(J_v, damping=1e-4)
-                        N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
-                        J_w_null = J_w @ N_v
-                        J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
-                        dq_orient = J_w_null_pinv @ (3.0 * w_rot)
-                        dq_orient_norm = np.linalg.norm(dq_orient)
-                        if dq_orient_norm > 0.15:
-                            dq_orient = dq_orient * (0.15 / dq_orient_norm)
-                        dq_target += dq_orient
+                    # Gated strictly by --enable-nullspace for unbiased 7-DOF trajectory execution
+                    if getattr(args, "enable_nullspace", False):
+                        R_live = forward_kinematics(curr_q_live)[:3, :3]
+                        w_rot = compute_so3_error_vector(R_live, DEFAULT_EE_ORIENTATION)
+                        if np.linalg.norm(w_rot) > 0.008:  # > 0.5 deg SO(3) 3D error
+                            J = analytical_jacobian(curr_q_live)
+                            J_v = J[:3, :]
+                            J_w = J[3:, :]
+                            J_v_pinv = damped_pinv(J_v, damping=1e-4)
+                            N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
+                            J_w_null = J_w @ N_v
+                            J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
+                            dq_orient = J_w_null_pinv @ (3.0 * w_rot)
+                            dq_orient_norm = np.linalg.norm(dq_orient)
+                            if dq_orient_norm > 0.15:
+                                dq_orient = dq_orient * (0.15 / dq_orient_norm)
+                            dq_target += dq_orient
                 else:
                     dq_target = np.array(vels[step], dtype=np.float64)
 
@@ -394,11 +396,12 @@ def run_sync_loop(arm, conn, args):
                     dq_safe = np.zeros(7, dtype=np.float64)
 
                 # Soft deceleration near cycle end (steps 13 & 14)
-                rem = steps_to_exec - 1 - step
-                if rem == 1:
-                    dq_safe *= 0.5
-                elif rem == 0:
-                    dq_safe *= 0.2
+                if getattr(args, "end_decel", "step") == "step":
+                    rem = steps_to_exec - 1 - step
+                    if rem == 1:
+                        dq_safe *= 0.5
+                    elif rem == 0:
+                        dq_safe *= 0.2
 
                 if not args.shadow:
                     arm.set_joint_velocities(dq_safe)
@@ -475,6 +478,8 @@ def main():
                         help="Invert Joint 0 (base yaw)")
     parser.add_argument("--enable-nullspace", action="store_true", default=False,
                         help="Enable artificial vertical orientation locking in nullspace (ablation only, default: False)")
+    parser.add_argument("--end-decel", type=str, choices=("step", "none"), default="step",
+                        help="Cycle end deceleration mode (default: step)")
     parser.add_argument("--shadow", action="store_true", default=False,
                         help="Shadow mode: log commands without moving physical robot")
     args = parser.parse_args()

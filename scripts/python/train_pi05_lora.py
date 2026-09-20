@@ -71,12 +71,12 @@ TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
 DEFAULT_DATASET_DIRS = [
     REPO_ROOT / "dataset" / "teleop_pick_cube_15hz_002",
 ]
-DEFAULT_OUTPUT_CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k"
+DEFAULT_OUTPUT_CKPT_DIR = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_crop169_20k"
 
 CHUNK_SIZE = 15
 DEFAULT_BATCH_SIZE = 4
 DEFAULT_GRAD_ACCUM = 2  # Effective batch size = 8
-DEFAULT_STEPS = 50000
+DEFAULT_STEPS = 20000
 DEFAULT_LR = 1e-4
 DEFAULT_WEIGHT_DECAY = 0.01
 DEFAULT_LOG_FREQ = 25
@@ -85,21 +85,34 @@ DEFAULT_EVAL_FREQ = 2500
 SEED = 42
 
 
-def preload_video_frames(video_path: Path):
+def preload_video_frames(video_path: Path, crop_16_9: bool = False):
     """Preload all video frames into memory as RGB numpy arrays."""
     container = av.open(str(video_path))
     frames = []
     for frame in container.decode(video=0):
-        frames.append(frame.to_ndarray(format="rgb24"))
+        arr = frame.to_ndarray(format="rgb24")
+        if crop_16_9:
+            # Northwestern / OpenPI DROID standard: Center-crop 4:3 (480x640) to 16:9 (360x640)
+            h, w = arr.shape[:2]
+            target_h = int(round(w * 9.0 / 16.0))
+            if h > target_h:
+                offset = (h - target_h) // 2
+                arr = np.ascontiguousarray(arr[offset : offset + target_h, :])
+            elif w > int(round(h * 16.0 / 9.0)):
+                target_w = int(round(h * 16.0 / 9.0))
+                offset = (w - target_w) // 2
+                arr = np.ascontiguousarray(arr[:, offset : offset + target_w])
+        frames.append(arr)
     container.close()
     return frames
 
 
-def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_seed=42):
+
+def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, num_val_episodes=4, val_seed=42, crop_16_9: bool = False):
     """
     Builds in-memory index of 15-step relative joint position chunks across all datasets:
       a_k = q_{t+k+1} - q_t = sum_{i=0}^k delta_q_{t+i} (for k = 0..14)
-      gripper_k = gripper_{t+k+1} (0=OPEN, 1=CLOSED)
+      gripper_k = action[t+k, 7] (0=OPEN, 1=CLOSED command)
     Implements deterministic episode-level split: held-out validation episodes have ZERO temporal leakage.
     """
     if isinstance(dataset_dirs, (str, Path)):
@@ -171,10 +184,11 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
                 continue
 
             print(f"  Loading video & parquet for {dataset_dir.name}/file-{fid:03d}...")
-            front_frames = preload_video_frames(cfg["front_mp4"])
-            wrist_frames = preload_video_frames(cfg["wrist_mp4"])
+            front_frames = preload_video_frames(cfg["front_mp4"], crop_16_9=crop_16_9)
+            wrist_frames = preload_video_frames(cfg["wrist_mp4"], crop_16_9=crop_16_9)
 
             states_raw = np.array([row.as_py() for row in table.column("observation.state")], dtype=np.float32)
+            actions_raw = np.array([row.as_py() for row in table.column("action")], dtype=np.float32)
             ep_indices = np.array(table.column("episode_index").to_pylist(), dtype=np.int32)
             task_indices = np.array(table.column("task_index").to_pylist(), dtype=np.int32)
 
@@ -182,6 +196,7 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
                 "front_frames": front_frames,
                 "wrist_frames": wrist_frames,
                 "states": states_raw,
+                "actions": actions_raw,
                 "episodes": ep_indices,
                 "task_indices": task_indices,
                 "length": len(states_raw)
@@ -218,7 +233,12 @@ def build_multitask_dataset(dataset_dirs, task_filter=None, val_ratio=0.15, val_
 
     # Deterministic episode-level train / val split
     all_episodes = sorted(list(set(s["global_ep_id"] for s in raw_samples)))
-    if val_ratio > 0.0 and len(all_episodes) >= 2:
+    if num_val_episodes is not None and num_val_episodes > 0:
+        rng = random.Random(val_seed)
+        shuffled_eps = list(all_episodes)
+        rng.shuffle(shuffled_eps)
+        val_ep_set = set(shuffled_eps[:min(num_val_episodes, len(all_episodes) - 1)])
+    elif val_ratio > 0.0 and len(all_episodes) >= 2:
         rng = random.Random(val_seed)
         num_val_eps = max(1, int(round(len(all_episodes) * val_ratio)))
         shuffled_eps = list(all_episodes)
@@ -269,7 +289,8 @@ def evaluate_sample(inference, s, cached_files, dfk=None):
 
     future_states = cf["states"][f_idx + 1 : f_idx + 1 + CHUNK_SIZE]
     gt_delta_q = future_states[:, :7] - curr_q[None, :]
-    gt_gripper = future_states[:, 7:8]
+    future_actions = cf["actions"][f_idx : f_idx + CHUNK_SIZE]
+    gt_gripper = future_actions[:, 7:8]
     gt_action_chunk = np.concatenate([gt_delta_q, gt_gripper], axis=1)
 
     front_t = torch.from_numpy(np.transpose(f_img, (2, 0, 1)))
@@ -365,7 +386,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_CKPT_DIR, help="Directory to save LoRA checkpoints")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--grad-accum", type=int, default=DEFAULT_GRAD_ACCUM, help="Gradient accumulation steps (default: 2)")
-    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Total training steps (default: 50000)")
+    parser.add_argument("--steps", type=int, default=DEFAULT_STEPS, help="Total training steps (default: 20000)")
     parser.add_argument("--lr", type=float, default=DEFAULT_LR, help="Learning rate for LoRA & projections (default: 1e-4)")
     parser.add_argument("--lang-rank", type=int, default=16, help="LoRA rank for PaliGemma-2B (default: 16)")
     parser.add_argument("--expert-rank", type=int, default=32, help="LoRA rank for Gemma-300M Expert (default: 32)")
@@ -378,20 +399,24 @@ def main():
     parser.add_argument("--task-filter", type=str, default=None, help="Filter dataset by task substring (e.g. 'red cube')")
     parser.add_argument("--preflight-only", action="store_true", help="Run empirical benchmark and exit")
     parser.add_argument("--val-ratio", type=float, default=0.15, help="Ratio of episodes held out for test/validation (default: 0.15)")
+    parser.add_argument("--num-val-episodes", type=int, default=4, help="Number of held-out demonstration episodes reserved for test set (default: 4)")
     parser.add_argument("--val-seed", type=int, default=42, help="Random seed for train/val episode split (default: 42)")
     parser.add_argument("--num-val-samples", type=int, default=25, help="Number of held-out test chunks evaluated on eval steps (default: 25)")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases real-time tracking")
     parser.add_argument("--wandb-project", type=str, default="pi05-franka-vla", help="W&B project name")
     parser.add_argument("--wandb-name", type=str, default=None, help="W&B run display name")
+    parser.add_argument("--wandb-id", type=str, default=None, help="W&B run unique ID for resuming the same run")
     parser.add_argument("--loss-mode", type=str, default="pure_flow", help="Legacy compatibility flag (always 'pure_flow')")
     parser.add_argument("--state-noise", type=float, default=0.0, help="Legacy compatibility flag (state noise is strictly disabled 0.0)")
     parser.add_argument("--wandb-mode", type=str, choices=("online", "offline", "disabled"), default="online", help="W&B mode (default: online)")
+    parser.add_argument("--image-crop", type=str, choices=("16_9", "none"), default="none", help="Image preprocessing crop mode (default: none / 4:3 native)")
     args = parser.parse_args()
 
     print("=" * 85)
-    print("  PI0.5 CLEAN PURE JOINT FLOW MATCHING LORA PIPELINE")
+    print(f"  PI0.5 CLEAN PURE JOINT FLOW MATCHING LORA PIPELINE (CROP: {args.image_crop.upper()})")
     print("=" * 85)
     print("[*] Loss Mode:       [PURE_FLOW] 100% Native OpenPI Joint Flow Matching Loss")
+    print(f"[*] Image Transform: [{args.image_crop.upper()}] Preprocessing mode")
     print("[*] Datasets ({}):".format(len(args.dataset)))
     for d in args.dataset:
         print(f"      - {d}")
@@ -403,7 +428,7 @@ def main():
     print(f"[*] Action Expert:   Rank={args.expert_rank}, Alpha={args.expert_rank*2}, Dropout={args.lora_dropout}")
     print(f"[*] Action Space:    15-step cumulative relative joint displacement a[k] = q[t+k+1] - q[t]")
     print(f"[*] State Noise:     DISABLED (Clean Ground Truth Joint Teleop)")
-    print(f"[*] Val Partition:   {args.val_ratio*100:.1f}% held-out episodes (seed={args.val_seed}, {args.num_val_samples} eval samples)")
+    print(f"[*] Held-Out Test:   {args.num_val_episodes} episodes (seed={args.val_seed}, {args.num_val_samples} eval samples)")
     print(f"[*] W&B Tracking:    {'ENABLED (Mode: ' + args.wandb_mode + ')' if args.wandb else 'DISABLED'}")
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "1")
     print(f"[*] Hardware:        Physical GPU {gpu_id} (RTX 5090 32GB, CUDA_VISIBLE_DEVICES={gpu_id})")
@@ -414,8 +439,11 @@ def main():
         args.dataset,
         task_filter=args.task_filter,
         val_ratio=args.val_ratio,
-        val_seed=args.val_seed
+        num_val_episodes=args.num_val_episodes,
+        val_seed=args.val_seed,
+        crop_16_9=(args.image_crop == "16_9")
     )
+
     task_names = sorted(list(train_task_buckets.keys()))
 
     # Initialize W&B if requested
@@ -423,25 +451,25 @@ def main():
     if args.wandb:
         import wandb
         run_name = args.wandb_name or f"pi05_pure_flow_{args.steps // 1000}k"
+        init_kwargs = {
+            "project": args.wandb_project,
+            "name": run_name,
+            "config": vars(args),
+            "mode": args.wandb_mode,
+        }
+        if args.wandb_id:
+            init_kwargs["id"] = args.wandb_id
+            init_kwargs["resume"] = "allow"
         try:
-            wandb_run = wandb.init(
-                project=args.wandb_project,
-                name=run_name,
-                config=vars(args),
-                mode=args.wandb_mode,
-            )
+            wandb_run = wandb.init(**init_kwargs)
             run_url = getattr(wandb_run, "url", None)
-            print(f"[W&B] Initialized run '{run_name}' in project '{args.wandb_project}' (Mode: {args.wandb_mode})")
+            print(f"[W&B] Initialized run '{run_name}' (ID: {wandb_run.id}) in project '{args.wandb_project}' (Mode: {args.wandb_mode})")
             if run_url:
                 print(f"[W&B URL] Real-Time Cloud Dashboard: {run_url}")
         except Exception as e:
             print(f"[W&B Warning] Online init failed: {e}. Falling back to offline mode...")
-            wandb_run = wandb.init(
-                project=args.wandb_project,
-                name=run_name,
-                config=vars(args),
-                mode="offline",
-            )
+            init_kwargs["mode"] = "offline"
+            wandb_run = wandb.init(**init_kwargs)
             print(f"[W&B] Initialized offline run '{run_name}'.")
 
     # 2. Model initialization
@@ -452,14 +480,26 @@ def main():
         stats_path=STATS_PATH,
         tokenizer_path=TOKENIZER_PATH,
         device="cuda:0",
-        profile="droid_jointpos"
+        profile="droid_jointpos",
+        crop_mode=args.image_crop,
+        trainable_fp32=True
     )
     print(f"[Model] Base model loaded in {time.perf_counter()-t0:.2f}s.")
 
     net = inference.network
     processor = inference.processor
 
-    # 3. Inject LoRA adapters with Dropout
+    # Ensure trainable projections are strictly float32 for high numerical precision & stability
+    net.action_in_proj.to(dtype=torch.float32)
+    net.action_out_proj.to(dtype=torch.float32)
+    net.time_mlp_in.to(dtype=torch.float32)
+    net.time_mlp_out.to(dtype=torch.float32)
+    net.action_in_proj.requires_grad_(True)
+    net.action_out_proj.requires_grad_(True)
+    net.time_mlp_in.requires_grad_(True)
+    net.time_mlp_out.requires_grad_(True)
+
+    # 3. Inject LoRA adapters with Dropout (initialized in float32)
     print(f"\n[LoRA] Injecting LoRA adapters (Language r={args.lang_rank}, Expert r={args.expert_rank}, Dropout={args.lora_dropout:.2f})...")
     lang_loras, expert_loras = inject_pi05_lora(
         net,
@@ -519,7 +559,7 @@ def main():
         print(f"[Resume] Successfully loaded weights! Resuming training from step {start_step} to {args.steps}...")
 
     for group in optimizer.param_groups:
-        group["initial_lr"] = args.lr
+        group.setdefault("initial_lr", group["lr"])
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -581,7 +621,8 @@ def main():
 
             future_states = cf["states"][f_idx + 1 : f_idx + 1 + CHUNK_SIZE]
             delta_q = future_states[:, :7] - curr_q[None, :]
-            gripper = future_states[:, 7:8]
+            future_actions = cf["actions"][f_idx : f_idx + CHUNK_SIZE]
+            gripper = future_actions[:, 7:8]
             action_chunk = np.concatenate([delta_q, gripper], axis=1)
 
             front_list.append(torch.from_numpy(np.transpose(f_img, (2, 0, 1))))
@@ -835,6 +876,9 @@ def main():
                 "lora_dropout": args.lora_dropout,
                 "args": vars(args),
                 "val_episodes": list(val_ep_set),
+                "action_semantics": "v2_gripper_action_command",
+                "image_crop": args.image_crop,
+                "precision": "fp32_lora_and_projections",
                 "timestamp": time.time(),
             }
             torch.save(save_payload, ckpt_path)

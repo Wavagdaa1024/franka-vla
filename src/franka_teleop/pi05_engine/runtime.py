@@ -26,14 +26,14 @@ class PI05Inference:
         self._queue = deque()
 
     @classmethod
-    def from_checkpoint(cls, checkpoint, *, stats_path, tokenizer_path, device="cpu", profile="checkpoint"):
+    def from_checkpoint(cls, checkpoint, *, stats_path, tokenizer_path, device="cpu", profile="checkpoint", crop_mode="none", trainable_fp32=False):
         root = Path(checkpoint).expanduser().resolve()
         if not root.is_dir() or not (root / "model.safetensors").is_file():
             raise FileNotFoundError("local checkpoint must contain config.json and model.safetensors")
         target = validate_device(device)
         config = PI05Config.from_file(root / "config.json")
         # Fail on missing preprocessing assets before allocating a full network.
-        processor = PI05Processor.from_local(config, stats_path, tokenizer_path, profile=profile)
+        processor = PI05Processor.from_local(config, stats_path, tokenizer_path, profile=profile, crop_mode=crop_mode)
         from .network import PI05Pytorch
         from accelerate import init_empty_weights
         # Keep nonpersistent rotary/position buffers on CPU; a blanket meta context
@@ -45,10 +45,16 @@ class PI05Inference:
         precision = "bfloat16" if (loaded_dtype == torch.bfloat16 or config.dtype == "bfloat16") else "float32"
         model.paligemma_with_expert.to_bfloat16_for_selected_params(precision)
         if precision == "bfloat16":
-            model.action_in_proj.to(dtype=torch.bfloat16)
-            model.action_out_proj.to(dtype=torch.bfloat16)
-            model.time_mlp_in.to(dtype=torch.bfloat16)
-            model.time_mlp_out.to(dtype=torch.bfloat16)
+            if trainable_fp32:
+                model.action_in_proj.to(dtype=torch.float32)
+                model.action_out_proj.to(dtype=torch.float32)
+                model.time_mlp_in.to(dtype=torch.float32)
+                model.time_mlp_out.to(dtype=torch.float32)
+            else:
+                model.action_in_proj.to(dtype=torch.bfloat16)
+                model.action_out_proj.to(dtype=torch.bfloat16)
+                model.time_mlp_in.to(dtype=torch.bfloat16)
+                model.time_mlp_out.to(dtype=torch.bfloat16)
         model.to(target)
         return cls(model, processor, device=device)
 

@@ -44,13 +44,13 @@ class LoRALinear(nn.Module):
             self.base_linear.bias.requires_grad = False
 
         if rank > 0:
-            # A initialized with kaiming uniform
+            # LoRA weights in float32 for high numerical precision & stability
             self.lora_A = nn.Parameter(
-                torch.empty(rank, self.in_features, dtype=base_linear.weight.dtype, device=base_linear.weight.device)
+                torch.empty(rank, self.in_features, dtype=torch.float32, device=base_linear.weight.device)
             )
             # B initialized to strictly zero (ensures zero perturbation at step 0)
             self.lora_B = nn.Parameter(
-                torch.zeros(self.out_features, rank, dtype=base_linear.weight.dtype, device=base_linear.weight.device)
+                torch.zeros(self.out_features, rank, dtype=torch.float32, device=base_linear.weight.device)
             )
             nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
 
@@ -204,13 +204,26 @@ def extract_lora_state_dict(net: nn.Module) -> Dict[str, torch.Tensor]:
 def load_lora_state_dict(net: nn.Module, state_dict: Dict[str, torch.Tensor], strict: bool = False):
     """
     Loads LoRA parameters and action projection weights into net.
+    Strict mode validates both unexpected keys AND missing trainable keys.
     """
     model_params = dict(net.named_parameters())
+    trainable_keys = {name for name, p in net.named_parameters() if p.requires_grad}
     loaded_count = 0
+    unexpected_keys = []
+
     for name, param in state_dict.items():
         if name in model_params:
-            model_params[name].data.copy_(param.to(device=model_params[name].device, dtype=model_params[name].dtype))
+            target_param = model_params[name]
+            target_param.data.copy_(param.to(device=target_param.device, dtype=target_param.dtype))
             loaded_count += 1
-        elif strict:
-            raise KeyError(f"Key {name} not found in target model parameters!")
-    print(f"[LoRA Loader] Successfully loaded {loaded_count}/{len(state_dict)} tensors.")
+        else:
+            unexpected_keys.append(name)
+
+    if strict:
+        if unexpected_keys:
+            raise KeyError(f"[LoRA Loader] Strict check failed: {len(unexpected_keys)} unexpected keys found in state_dict! E.g.: {unexpected_keys[:5]}")
+        missing_keys = [k for k in trainable_keys if k not in state_dict]
+        if missing_keys:
+            raise KeyError(f"[LoRA Loader] Strict check failed: {len(missing_keys)} required trainable keys missing from checkpoint! E.g.: {missing_keys[:5]}")
+
+    print(f"[LoRA Loader] Successfully loaded {loaded_count}/{len(state_dict)} tensors (strict={strict}).")

@@ -403,13 +403,17 @@ class PI05Pytorch(nn.Module):
         self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         past_key_values = clone_past_key_values(past_key_values)
+        expert_dtype = next(self.paligemma_with_expert.gemma_expert.parameters()).dtype
+        suffix_embs_expert = suffix_embs.to(dtype=expert_dtype) if suffix_embs.dtype != expert_dtype else suffix_embs
+        adarms_cond_expert = adarms_cond.to(dtype=expert_dtype) if (adarms_cond is not None and adarms_cond.dtype != expert_dtype) else adarms_cond
+
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
+            inputs_embeds=[None, suffix_embs_expert],
             use_cache=False,
-            adarms_cond=[None, adarms_cond],
+            adarms_cond=[None, adarms_cond_expert],
         )
 
         suffix_out = outputs_embeds[1]

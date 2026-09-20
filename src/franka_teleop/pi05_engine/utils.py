@@ -18,10 +18,46 @@
 # Modified: minimal inference extraction from LeRobot v0.6.1
 # 7e241bd630a3719a56157a497ce5d08f244784f1; no full LeRobot imports.
 import math
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 OPENPI_ATTENTION_MASK_VALUE = -2.3819763e38
+
+
+def crop_to_16_9_torch(images: torch.Tensor) -> torch.Tensor:
+    """
+    Center crops tensor of shape [*B, H, W, C] to 16:9 aspect ratio.
+    Adheres strictly to Northwestern IDEAS Lab and OpenPI DROID convention.
+    For 640x480 (4:3), crops vertical height to 360 (offset 60px top and bottom) yielding 640x360 (16:9).
+    """
+    H, W = images.shape[-3], images.shape[-2]
+    target_H = int(round(W * 9.0 / 16.0))
+    if H > target_H:
+        offset = (H - target_H) // 2
+        return images[..., offset : offset + target_H, :, :]
+    elif W > int(round(H * 16.0 / 9.0)):
+        target_W = int(round(H * 16.0 / 9.0))
+        offset = (W - target_W) // 2
+        return images[..., :, offset : offset + target_W, :]
+    return images
+
+
+def crop_to_16_9_np(image: np.ndarray) -> np.ndarray:
+    """
+    Center crops numpy array of shape [H, W, C] to 16:9 aspect ratio.
+    """
+    h, w = image.shape[:2]
+    target_h = int(round(w * 9.0 / 16.0))
+    if h > target_h:
+        offset = (h - target_h) // 2
+        return np.ascontiguousarray(image[offset : offset + target_h, :, :])
+    elif w > int(round(h * 16.0 / 9.0)):
+        target_w = int(round(h * 16.0 / 9.0))
+        offset = (w - target_w) // 2
+        return np.ascontiguousarray(image[:, offset : offset + target_w, :])
+    return image
+
 
 def get_safe_dtype(dtype, device):
     if device not in {"cpu", "cuda"}:

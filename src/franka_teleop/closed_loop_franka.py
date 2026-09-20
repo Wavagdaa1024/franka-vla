@@ -308,6 +308,7 @@ def run_rtc_loop(arm, conn, args):
 
     step_in_chunk = 0
     prefetch_sent = False
+    prefetch_step_in_chunk = 0
     next_chunk = None
     t_starve_start = None
     MAX_STARVATION_SECS = 5.0
@@ -322,11 +323,15 @@ def run_rtc_loop(arm, conn, args):
 
             # 1. Trigger asynchronous prefetch early in chunk execution
             if step_in_chunk >= args.preempt_step and not prefetch_sent:
+                prefetch_time = time.time()
+                prefetch_step_in_chunk = step_in_chunk
                 state_msg = {
                     "loop": chunk_idx + 1,
                     "q": curr_q.tolist(),
                     "pos": curr_pos.tolist(),
-                    "gripper": read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0))
+                    "gripper": read_gripper_normalized(arm, default=(1.0 if gripper_state == 1 else 0.0)),
+                    "prefetch_step": prefetch_step_in_chunk,
+                    "timestamp": prefetch_time,
                 }
                 if client.request_chunk(state_msg):
                     prefetch_sent = True
@@ -349,14 +354,20 @@ def run_rtc_loop(arm, conn, args):
                 grip_targets = active_chunk.get("gripper", [])
                 action_mode = active_chunk.get("action_mode", "joint_position" if pos_targets else "joint_velocity")
                 use_pos = (action_mode == "joint_position" and len(pos_targets) > 0)
-                step_in_chunk = 0
+                total_steps = len(pos_targets) if use_pos else len(vel_targets)
+
+                # Compensate for elapsed steps since observation was captured for prefetch
+                elapsed_steps = max(0, step_in_chunk - prefetch_step_in_chunk)
+                step_in_chunk = min(elapsed_steps, max(0, total_steps - 1))
+
                 prefetch_sent = False
+                prefetch_step_in_chunk = step_in_chunk
                 next_chunk = None
                 chunk_idx += 1
                 t_starve_start = None
                 client.drain_responses()
                 p_now, _ = arm.get_cartesian_pose()
-                print(f"[Continuous Handover #{chunk_idx:03d}] EE: [{p_now[0]:.3f}, {p_now[1]:.3f}, {p_now[2]:.3f}] | Continuous Stream")
+                print(f"[Continuous Handover #{chunk_idx:03d}] EE: [{p_now[0]:.3f}, {p_now[1]:.3f}, {p_now[2]:.3f}] | Age Aligned: starting at step {step_in_chunk}/{total_steps} (compensated {elapsed_steps} steps)")
 
             # 4. Target extraction & Starvation Fallback
             total_steps = len(pos_targets) if use_pos else len(vel_targets)
