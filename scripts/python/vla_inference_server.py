@@ -54,6 +54,8 @@ CKPT_ALIASES = {
     # Canonical 50k Pure Flow Checkpoints
     "pure_flow": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
     "pure_flow_latest": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_50k": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_50000": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "step_50000.pt",
     "pure_flow_2500": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "step_02500.pt",
     # Archived / Ablation Aliases
     "cartesian_7d": PROJECT_ROOT / "outputs" / "checkpoints" / "pi05_lora_cartesian_7d" / "pi05_lora_multitask_step_2000.pt",
@@ -379,7 +381,7 @@ def main():
     parser = argparse.ArgumentParser(description="Franka Pi0.5 VLA High-Performance Inference Server.")
     parser.add_argument("--port", type=int, default=8088, help="Server port (default: 8088)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Bind host (default: 0.0.0.0)")
-    parser.add_argument("--checkpoint", type=str, default="cartesian_7d_2000", help="Initial checkpoint alias or path")
+    parser.add_argument("--checkpoint", type=str, default="pure_flow", help="Initial checkpoint alias or path")
     args = parser.parse_args()
 
     gpu_id = os.environ.get("CUDA_VISIBLE_DEVICES", "1")

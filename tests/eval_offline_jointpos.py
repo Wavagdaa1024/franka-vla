@@ -38,7 +38,16 @@ REPO_ROOT = PROJECT_ROOT
 CHECKPOINT_DIR = REPO_ROOT / "checkpoints" / "pi05_droid_jointpos"
 STATS_PATH = CHECKPOINT_DIR / "auxiliary" / "openpi_droid_jointpos_norm_stats.json"
 TOKENIZER_PATH = CHECKPOINT_DIR / "auxiliary" / "paligemma_tokenizer.model"
-DEFAULT_DATASET_DIR = REPO_ROOT / "dataset" / "teleop_pick_vegetables_15hz_001"
+DEFAULT_DATASET_DIR = REPO_ROOT / "dataset" / "teleop_pick_cube_15hz_002"
+DEFAULT_CKPT = REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt"
+
+CKPT_ALIASES = {
+    "pure_flow": REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_latest": REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_50k": REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "latest.pt",
+    "pure_flow_50000": REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "step_50000.pt",
+    "pure_flow_2500": REPO_ROOT / "outputs" / "checkpoints" / "pi05_lora_pure_flow_50k" / "step_02500.pt",
+}
 
 CHUNK_SIZE = 15
 
@@ -74,20 +83,46 @@ def evaluate_checkpoint(dataset_dir: Path, ckpt_path=None, test_episode=0, num_e
     )
     print(f"[Model] Base model loaded in {time.perf_counter()-t0:.2f}s.")
 
-    if ckpt_path and Path(ckpt_path).exists():
-        print(f"[Model] Loading weights from {Path(ckpt_path).name}...")
-        ckpt = torch.load(str(ckpt_path), map_location="cuda:0", weights_only=False)
-        state_dict = ckpt.get("state_dict", ckpt)
-        missing, unexpected = inference.network.load_state_dict(state_dict, strict=False)
-        trainable_names = {name for name, _ in inference.network.named_parameters()
-                           if any(part in name for part in ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"))}
-        missing_trainable = sorted(trainable_names.intersection(missing))
-        if missing_trainable or unexpected:
-            print(f"[Warning] Mismatch: missing={len(missing_trainable)}, unexpected={len(unexpected)}")
+    if ckpt_path is None:
+        ckpt_path = DEFAULT_CKPT if DEFAULT_CKPT.exists() else None
+    elif str(ckpt_path).strip().lower() in CKPT_ALIASES:
+        ckpt_path = CKPT_ALIASES[str(ckpt_path).strip().lower()]
+    else:
+        p = Path(ckpt_path)
+        if not p.exists() and (REPO_ROOT / "outputs" / "checkpoints" / ckpt_path).exists():
+            ckpt_path = REPO_ROOT / "outputs" / "checkpoints" / ckpt_path
         else:
+            ckpt_path = p
+
+    if ckpt_path and Path(ckpt_path).exists():
+        resolved_ckpt = Path(ckpt_path)
+        print(f"[Model] Loading weights from {resolved_ckpt.name}...")
+        ckpt = torch.load(str(resolved_ckpt), map_location="cuda:0", weights_only=False)
+        state_dict = ckpt.get("model_state_dict", ckpt.get("state_dict", ckpt))
+        is_lora = any("lora_" in k for k in state_dict.keys()) or "lora" in str(resolved_ckpt).lower()
+        if is_lora:
+            from franka_teleop.pi05_engine.lora import inject_pi05_lora, load_lora_state_dict
+            lang_r = ckpt.get("lang_rank", 16)
+            exp_r = ckpt.get("expert_rank", 32)
+            has_lora = hasattr(inference.network.paligemma_with_expert.paligemma.model.language_model.layers[0].self_attn.q_proj, "lora_A")
+            if not has_lora:
+                print(f"[Model] Injecting LoRA architecture (Lang r={lang_r}, Expert r={exp_r})...")
+                inject_pi05_lora(inference.network, lang_rank=lang_r, expert_rank=exp_r)
+            load_lora_state_dict(inference.network, state_dict, strict=True)
             step_info = ckpt.get('step', '?')
             loss_info = ckpt.get('loss', 0.0)
-            print(f"[Model OK] Fine-tuned weights loaded cleanly! (Step: {step_info}, Loss: {loss_info:.5f})")
+            print(f"[Model OK] LoRA multi-task weights loaded! (Step: {step_info}, Loss: {loss_info})")
+        else:
+            missing, unexpected = inference.network.load_state_dict(state_dict, strict=False)
+            trainable_names = {name for name, _ in inference.network.named_parameters()
+                               if any(part in name for part in ("gemma_expert", "action_in_proj", "action_out_proj", "time_mlp_in", "time_mlp_out"))}
+            missing_trainable = sorted(trainable_names.intersection(missing))
+            if missing_trainable or unexpected:
+                print(f"[Warning] Mismatch: missing={len(missing_trainable)}, unexpected={len(unexpected)}")
+            else:
+                step_info = ckpt.get('step', '?')
+                loss_info = ckpt.get('loss', 0.0)
+                print(f"[Model OK] Fine-tuned weights loaded cleanly! (Step: {step_info}, Loss: {loss_info:.5f})")
 
     inference.network.eval()
 
@@ -248,7 +283,7 @@ def evaluate_checkpoint(dataset_dir: Path, ckpt_path=None, test_episode=0, num_e
 def main():
     parser = argparse.ArgumentParser(description="Evaluate Pi0.5 jointpos checkpoint against ground truth actions.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET_DIR, help="Path to dataset directory")
-    parser.add_argument("--checkpoint", type=Path, default=None, help="Path to action_expert checkpoint (.pt)")
+    parser.add_argument("--checkpoint", default="pure_flow", help="Path to checkpoint (.pt) or alias (pure_flow, pure_flow_50k, etc.)")
     parser.add_argument("--episode", type=int, default=0, help="Episode index to evaluate (default: 0)")
     parser.add_argument("--num-samples", type=int, default=5, help="Number of frames across episode to evaluate")
     args = parser.parse_args()

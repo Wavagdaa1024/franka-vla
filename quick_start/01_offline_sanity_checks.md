@@ -1,6 +1,6 @@
 # 教程 01：前置自检与离线测试 (01_offline_sanity_checks.md)
 
-本教程指导在正式连接机械臂前，如何在 Windows GPU 服务器上完成模型资产自检、安全门禁单测、核心运动学单测以及离线影子运行。
+本教程指导在正式连接机械臂前，如何在 Windows GPU 服务器上完成模型资产自检、安全门禁单测、核心运动学单测、模型离线轨迹对比以及影子运行。
 
 ---
 
@@ -68,7 +68,7 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\test_kinematics_and_rtc.
 
 ## 4. 运行可微正向运动学 (DFK) 梯度检查
 
-验证 DFK 梯度求导与反向传播是否在 GPU 1 上正确执行（用于支持笛卡尔空间位姿损失训练）：
+验证 DFK 梯度求导与反向传播是否在 GPU 1 上正确执行：
 
 ```cmd
 cd /d C:\Users\74727\Desktop\project\VLA_franka
@@ -87,85 +87,53 @@ C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\test_differentiable_fk.p
 
 ### 5.1 双摄持续实时监控 (`.\scripts\live_camera.bat`)
 
-如需在实验过程中**一直持续查看相机实时画面**（如确认物料摆放、观察手腕视角），直接运行该脚本：
-
-#### 使用方法：
-在工程根目录下（`C:\Users\74727\Desktop\project\VLA_franka`）直接运行：
-
+在工程根目录下运行：
 ```powershell
 cd C:\Users\74727\Desktop\project\VLA_franka
 .\scripts\live_camera.bat
 ```
-
-#### 支持的双模查看方式：
-程序启动后会**同时开启**以下两种实时查看通道：
-1. **Windows 桌面实时窗口 (OpenCV GUI)**：
-   - 桌面直接弹出独立画面窗口，左右并排显示 **Front 头部相机**（S/N: `254322072252`）与 **Wrist 腕部相机**（S/N: `348122070854`）；
-   - 窗口左上角实时显示 30 FPS 刷新帧率，按 **`q`** 或 **`ESC`** 即可安全退出。
-2. **局域网 / 浏览器实时流 (MJPEG Web Stream)**：
-   - 后台自动拉起轻量 HTTP 流媒体服务，任何设备直接在浏览器打开即可查看：
-     - **本机浏览器**：[http://localhost:8080](http://localhost:8080)
-     - **局域网手机 / 平板 / 其他电脑**：`http://10.70.242.38:8080`
-
-#### 常用可选参数：
-- **纯网页模式 (无 GUI 桌面弹窗)**：
-  适合在 SSH 远程终端下使用，不弹 Windows 窗口，只推流到网页：
-  ```powershell
-  .\scripts\live_camera.bat --no-gui
-  ```
-- **自定义 Web 服务端口** (例如指定 5000 端口)：
-  ```powershell
-  .\scripts\live_camera.bat --port 5000
-  ```
-
----
+- **Windows 桌面窗口**：左右并排显示 Front 头部相机与 Wrist 腕部相机，30 FPS 刷新；
+- **局域网 / 浏览器实时流**：在浏览器打开 [http://localhost:8080](http://localhost:8080) 或 `http://<本机IP>:8080`。
 
 ### 5.2 硬件快速抽样体检 (`.\scripts\check_cameras.bat`)
 
-快速捕获 15 帧排查设备连通性、掉帧率、RGB/深度数据包及设备序列号是否匹配：
-
+快速捕获 15 帧排查连通性与丢包率：
 ```powershell
-cd C:\Users\74727\Desktop\project\VLA_franka
 .\scripts\check_cameras.bat
 ```
-*(如需同时弹出窗口查看快速采样的画面：`.\scripts\check_cameras.bat --gui`)*
 
 ---
 
-### 5.3 相机相关脚本对比速查表
+## 6. 运行 GPU 1 离线真实轨迹对比评测 (Ground Truth vs Pred)
 
-| 脚本 | 核心作用 | 交互方式 | 退出方式 |
-| :--- | :--- | :--- | :--- |
-| **`.\scripts\live_camera.bat`** | **双摄持续监控 (日常首选)** | 桌面 OpenCV 窗口 + Web 浏览器 (`:8080`) | 按 `q` / `ESC` |
-| **`.\scripts\align_camera.bat`** | **头部相机 6-DoF 标定复位** | ChArUco 亚像素锁定 + 手机 Web 看板 (`:8088`) | 误差达标后按 `q` |
-| **`.\scripts\check_cameras.bat`** | **硬件设备快速体检** | 采样 15 帧排查掉帧与设备状态 | 跑完自动退出 |
-
----
-
-## 6. 运行 GPU 1 单卡隔离影子推理自检 (Shadow Run)
-
-使用本地保存的双相机基准图与 Franka 初始位姿，执行全流程影子推理测试（仅模型推理，不下发物理动作）：
+直接与人工真实遥操作数据集中的真值动作分块（15 步未来关节增量与夹爪）进行逐帧对比，输出关节 MAE、RMSE、动作幅值比与夹爪开合准确率：
 
 ```cmd
 cd /d C:\Users\74727\Desktop\project\VLA_franka
-C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\shadow_run_pi05.py
+C:\Users\74727\miniconda3\envs\lerobot\python.exe tests\eval_offline_jointpos.py --checkpoint pure_flow
 ```
 
-- **关键指标核验**：
-  - `CUDA_VISIBLE_DEVICES = 1`（物理 GPU 0 绝对零占用）
-  - 4 项基准任务推理全部通过（`pick up the purple onion`, `place into the brown basket` 等）
-  - 平均推理时延 $\approx 290$ ms（15 步 action chunk 耗时，远小于物理动作周期 500ms）
-  - 实时因子 RTF $< 1.0$（实测 $\approx 0.58$）
-  - 数值安全：**100% 有限值，0 NaN / 0 Inf**
-  - 结果自动保存至 `outputs\m3_shadow_run.json`
+- **核心评估指标**：
+  - **Joint MAE**：$< 0.020\text{ rad} \ (\approx 1.1^\circ)$，跟踪性能优秀。
+  - **Gripper Match**：$\ge 95\%$，开合意图完全对齐。
+  - **Scale Ratio**：$0.5\text{x} \sim 2.0\text{x}$，无预测塌缩或过度放大。
 
 ---
 
 ## 7. 运行 Agent 管道离线 Mock 自检
 
-通过推理主入口验证权重加载与多任务提示词解析（不连接物理机械臂与摄像头）：
+在完全不接物理机械臂与相机的情况下，一键验证 Agent 主脚本的模型加载、LoRA 挂载、前向推理及算力时延：
 
 ```cmd
 cd /d C:\Users\74727\Desktop\project\VLA_franka
-.\scripts\run_agent.bat --mock --checkpoint cartesian_1000
+.\scripts\run_agent.bat --mock
 ```
+
+- **预期输出**：
+  ```text
+  [Model OK] LoRA Multi-Task Adapters loaded! (Step: 50000)
+  [Mock Pass 1/5] Latency: 748.2ms | Step 1 dq[0..2]: [...]
+  [Mock Pass 2/5] Latency: 353.1ms | Step 1 dq[0..2]: [...]
+  [MOCK TEST PASSED] Steady-state Latency: ~353ms (~2.8 FPS)
+  * Model is fully operational and ready for live robot deployment!
+  ```

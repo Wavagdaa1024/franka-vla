@@ -111,14 +111,14 @@ def run_tests():
     try:
         t0 = time.perf_counter()
         res = http_post(f"{SERVER_URL}/switch_checkpoint", {
-            "checkpoint": "cartesian_7d_2500"
+            "checkpoint": "pure_flow_2500"
         })
         switch_ms = (time.perf_counter() - t0) * 1000.0
         print(f"  [OK] Switched in {switch_ms:.1f}ms! Active: {res.get('info', {}).get('name')}")
 
         # Switch back to default
-        http_post(f"{SERVER_URL}/switch_checkpoint", {"checkpoint": "cartesian_7d_2000"})
-        print("  [OK] Restored default checkpoint: cartesian_7d_2000.")
+        http_post(f"{SERVER_URL}/switch_checkpoint", {"checkpoint": "pure_flow"})
+        print("  [OK] Restored default checkpoint: pure_flow.")
     except Exception as e:
         print(f"  [WARN] Switch checkpoint: {e}")
 
