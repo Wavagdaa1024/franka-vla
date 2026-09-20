@@ -27,11 +27,16 @@ from franka_teleop.kinematics import (
     forward_kinematics,
     analytical_jacobian,
     compute_ee_tilt,
+    compute_ee_orientation_error,
+    compute_so3_angle_error,
+    DEFAULT_EE_ORIENTATION,
     solve_ee_recovery_joints,
+    solve_ee_recovery_joints_6dof,
     generate_smooth_recovery_traj,
     DEFAULT_Z_FLOOR,
     FRANKA_JOINT_LIMITS
 )
+
 
 
 class MockArm:
@@ -129,6 +134,39 @@ class TestPoseRecovery(unittest.TestCase):
                 self.assertGreaterEqual(q_rec[j], low - 1e-4)
                 self.assertLessEqual(q_rec[j], high + 1e-4)
 
+    def test_yaw_rotation_detection_and_recovery(self):
+        """
+        Verify that pure yaw twist (e.g. Joint 7 rotating counter-clockwise or clockwise)
+        is accurately detected by the 3D SO(3) metric even when tilt is virtually zero,
+        and that 6-DOF IK restores all 3 rotational DOFs (Roll, Pitch, Yaw) back to nominal.
+        """
+        # Induce +20 deg counter-clockwise yaw spin on Joint 7
+        q_yaw_ccw = self.q_nominal.copy()
+        q_yaw_ccw[6] += 0.35  # ~20.0 deg rotation around tool Z-axis
+
+        so3_err, tilt = compute_ee_orientation_error(q_yaw_ccw, DEFAULT_EE_ORIENTATION)
+        # Tilt should be negligible (< 3.0 deg), while SO(3) error must be ~20.0 deg!
+        self.assertLess(tilt, 3.0, f"Pure yaw should not induce significant tilt, got {tilt:.2f} deg")
+        self.assertGreater(so3_err, 18.0, f"SO(3) error must detect yaw spin, got {so3_err:.2f} deg")
+
+        # Solve recovery
+        p_initial = forward_kinematics(q_yaw_ccw)[:3, 3]
+        q_rec, so3_after, pos_err = solve_ee_recovery_joints(q_yaw_ccw, z_floor=DEFAULT_Z_FLOOR, max_iters=35)
+
+        # Assert full 3-DOF alignment: residual SO(3) error < 0.05 deg!
+        self.assertLess(so3_after, 0.05, f"SO(3) error after recovery should be < 0.05 deg, got {so3_after:.4f} deg")
+        p_rec = forward_kinematics(q_rec)[:3, 3]
+        xy_err_mm = np.linalg.norm(p_rec[:2] - p_initial[:2]) * 1000.0
+        self.assertLess(xy_err_mm, 0.5, f"Position drift during yaw recovery must be < 0.5 mm, got {xy_err_mm:.3f} mm")
+
+        # Repeat for clockwise yaw twist (-20 deg)
+        q_yaw_cw = self.q_nominal.copy()
+        q_yaw_cw[6] -= 0.35
+        so3_err_cw, tilt_cw = compute_ee_orientation_error(q_yaw_cw, DEFAULT_EE_ORIENTATION)
+        self.assertGreater(so3_err_cw, 18.0)
+        q_rec_cw, so3_after_cw, _ = solve_ee_recovery_joints(q_yaw_cw, z_floor=DEFAULT_Z_FLOOR, max_iters=35)
+        self.assertLess(so3_after_cw, 0.05, f"SO(3) clockwise recovery error: {so3_after_cw:.4f} deg")
+
     def test_floor_protection_lifting_during_recovery(self):
         """Test that if recovery is triggered below floor, Z is automatically lifted."""
         # Find a configuration with Z < z_floor
@@ -205,9 +243,25 @@ class TestPoseRecovery(unittest.TestCase):
         self.assertTrue(did_recover)
         self.assertGreater(len(arm_tilted.cmd_history), 0)
 
-        # Arm final pose should be upright
-        tilt_final = compute_ee_tilt(arm_tilted.get_joint_positions())
-        self.assertLess(tilt_final, 0.5, f"Post-recovery tilt should be < 0.5 deg, got {tilt_final:.2f} deg")
+        # Arm final pose should restore all 3 DOFs back to nominal ready pose (SO(3) error < 0.5 deg)
+        so3_final, tilt_final = compute_ee_orientation_error(arm_tilted.get_joint_positions(), DEFAULT_EE_ORIENTATION)
+        self.assertLess(so3_final, 0.5, f"Post-recovery SO(3) error should be < 0.5 deg, got {so3_final:.2f} deg")
+        self.assertLess(tilt_final, 3.0, f"Post-recovery tilt should be < 3.0 deg, got {tilt_final:.2f} deg")
+
+        # 3. Under pure yaw twisted pose (tilt < 3.0°, SO(3) > 18.0°): MUST trigger recovery!
+        q_yaw = self.q_nominal.copy()
+        q_yaw[6] += 0.35  # ~20 deg yaw
+        so3_yaw, tilt_yaw = compute_ee_orientation_error(q_yaw, DEFAULT_EE_ORIENTATION)
+        self.assertLess(tilt_yaw, 3.0)
+        self.assertGreater(so3_yaw, 18.0)
+
+        arm_yaw = MockArm(q_yaw)
+        q_out_yaw, did_recover_yaw = check_and_restore_ee_pose(arm_yaw, q_yaw, args, rate)
+        self.assertTrue(did_recover_yaw, "Pose guard failed to trigger on yaw twist!")
+        self.assertGreater(len(arm_yaw.cmd_history), 0)
+
+        so3_rec, _ = compute_ee_orientation_error(arm_yaw.get_joint_positions(), DEFAULT_EE_ORIENTATION)
+        self.assertLess(so3_rec, 1.0, f"Post-recovery SO(3) error should be < 1.0 deg, got {so3_rec:.2f} deg")
 
     def test_multi_cycle_sync_simulation_with_drift(self):
         """Simulate continuous synchronous cycles where tilt drift is induced and auto-corrected."""
@@ -218,24 +272,28 @@ class TestPoseRecovery(unittest.TestCase):
         rate = MockRate()
 
         recovery_events = []
-        for cycle in range(1, 6):
+        for cycle in range(1, 7):
             curr_q = arm.get_joint_positions()
             
-            # In cycle 3, inject simulated open-loop joint drift
+            # In cycle 3, inject simulated open-loop joint tilt drift
             if cycle == 3:
                 curr_q[4] += 0.30
+                arm._q = curr_q.copy()
+            # In cycle 5, inject simulated open-loop counter-clockwise yaw drift
+            elif cycle == 5:
+                curr_q[6] += 0.35
                 arm._q = curr_q.copy()
 
             curr_q, did_recover = check_and_restore_ee_pose(arm, curr_q, args, rate)
             if did_recover:
                 recovery_events.append(cycle)
 
-            # Sampled pose before inference MUST be strictly in-distribution (<= max_tilt_deg)
-            sampled_tilt = compute_ee_tilt(curr_q)
-            self.assertLessEqual(sampled_tilt, args.max_tilt_deg,
-                                 f"Cycle {cycle}: sampled tilt {sampled_tilt:.2f} deg is OOD (> {args.max_tilt_deg} deg)!")
+            # Sampled pose before inference MUST be strictly in-distribution (SO(3) <= max_tilt_deg)
+            sampled_so3, sampled_tilt = compute_ee_orientation_error(curr_q, DEFAULT_EE_ORIENTATION)
+            self.assertLessEqual(sampled_so3, args.max_tilt_deg,
+                                 f"Cycle {cycle}: sampled SO(3) error {sampled_so3:.2f} deg is OOD (> {args.max_tilt_deg} deg)!")
 
-        self.assertEqual(recovery_events, [3], "Recovery should have triggered exactly at Cycle 3")
+        self.assertEqual(recovery_events, [3, 5], "Recovery should have triggered at Cycle 3 (tilt) and Cycle 5 (yaw)")
 
 
 if __name__ == "__main__":

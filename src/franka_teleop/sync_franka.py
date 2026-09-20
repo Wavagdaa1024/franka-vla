@@ -85,6 +85,9 @@ try:
         damped_pinv,
         project_velocity_z_floor,
         compute_ee_tilt,
+        compute_ee_orientation_error,
+        compute_so3_error_vector,
+        DEFAULT_EE_ORIENTATION,
         solve_ee_recovery_joints,
         generate_smooth_recovery_traj,
         DEFAULT_Z_FLOOR,
@@ -97,6 +100,9 @@ except ImportError:
         damped_pinv,
         project_velocity_z_floor,
         compute_ee_tilt,
+        compute_ee_orientation_error,
+        compute_so3_error_vector,
+        DEFAULT_EE_ORIENTATION,
         solve_ee_recovery_joints,
         generate_smooth_recovery_traj,
         DEFAULT_Z_FLOOR,
@@ -181,33 +187,33 @@ def read_gripper_normalized(arm, default=0.0):
 def check_and_restore_ee_pose(arm, curr_q, args, rate):
     """
     Checks if end-effector pose deviates beyond safe thresholds:
-      - Tilt exceeds args.max_tilt_deg (e.g. 8.0°)
+      - 3D SO(3) rotation error exceeds args.max_tilt_deg (e.g. 8.0°) - covers Roll, Pitch, and Yaw!
       - Position drops below args.z_min (table floor)
-    If deviated, executes smooth restorative trajectory to return to vertical downward orientation
-    and safe height without disturbing the (X, Y) task trajectory.
+    If deviated, executes smooth restorative trajectory to return to canonical orientation
+    (all 3 rotational DOFs restored, zero tilt and zero yaw twist) and safe height.
     Returns:
       (updated_q, did_recover)
     """
     if not getattr(args, "recover_ee", True) or curr_q is None:
         return curr_q, False
 
-    tilt_deg = compute_ee_tilt(curr_q)
+    so3_err_deg, tilt_deg = compute_ee_orientation_error(curr_q, DEFAULT_EE_ORIENTATION)
     T_live = forward_kinematics(curr_q)
     p_live = T_live[:3, 3]
 
-    needs_recovery = (tilt_deg > args.max_tilt_deg) or (p_live[2] < args.z_min)
+    needs_recovery = (so3_err_deg > args.max_tilt_deg) or (p_live[2] < args.z_min)
     if not needs_recovery:
         return curr_q, False
 
     reasons = []
-    if tilt_deg > args.max_tilt_deg:
-        reasons.append(f"Tilt {tilt_deg:.1f}° > {args.max_tilt_deg:.1f}°")
+    if so3_err_deg > args.max_tilt_deg:
+        reasons.append(f"SO(3) error {so3_err_deg:.1f}° > {args.max_tilt_deg:.1f}° (Tilt: {tilt_deg:.1f}°)")
     if p_live[2] < args.z_min:
         reasons.append(f"Z {p_live[2]*1000.0:.1f}mm < {args.z_min*1000.0:.1f}mm")
     reason_str = ", ".join(reasons)
 
-    print(f"\n[POSE GUARD] OOD State Detected ({reason_str})! Restoring upright EE pose...")
-    q_target, tilt_after, pos_err = solve_ee_recovery_joints(
+    print(f"\n[POSE GUARD] OOD 3D Orientation Detected ({reason_str})! Restoring all 3 DOFs (Roll, Pitch, Yaw)...")
+    q_target, so3_after, pos_err = solve_ee_recovery_joints(
         curr_q, z_floor=args.z_min, max_iters=args.recovery_iters, z_lift=0.003
     )
     dq_traj = generate_smooth_recovery_traj(
@@ -235,7 +241,8 @@ def check_and_restore_ee_pose(arm, curr_q, args, rate):
 
     q_final = arm.get_joint_positions()
     p_final = forward_kinematics(q_final)[:3, 3] if q_final is not None else p_live
-    print(f"[POSE GUARD OK] Recovery Finished: Tilt {tilt_after:.2f}° (drift {tilt_deg - tilt_after:.1f}° cleared) | EE: [{p_final[0]:+.3f}, {p_final[1]:+.3f}, {p_final[2]:+.3f}]m\n")
+    so3_final, tilt_final = compute_ee_orientation_error(q_final, DEFAULT_EE_ORIENTATION)
+    print(f"[POSE GUARD OK] 3D Recovery Complete: SO(3) Error {so3_final:.2f}° (drift {so3_err_deg - so3_final:.1f}° cleared), Tilt {tilt_final:.2f}° | EE: [{p_final[0]:+.3f}, {p_final[1]:+.3f}, {p_final[2]:+.3f}]m\n")
     return q_final, True
 
 
@@ -334,10 +341,10 @@ def run_sync_loop(arm, conn, args):
                     pos_err = q_des - curr_q_live
                     dq_target = args.kp_pos * pos_err
 
-                    # Real-time closed-loop vertical orientation locking in position nullspace
-                    z_live = forward_kinematics(curr_q_live)[:3, 2]
-                    w_tilt = np.cross(z_live, [0.0, 0.0, -1.0])
-                    if np.linalg.norm(w_tilt) > 0.005:  # > 0.3 deg tilt
+                    # Real-time closed-loop 3-DOF orientation locking in position nullspace (Roll, Pitch, Yaw)
+                    R_live = forward_kinematics(curr_q_live)[:3, :3]
+                    w_rot = compute_so3_error_vector(R_live, DEFAULT_EE_ORIENTATION)
+                    if np.linalg.norm(w_rot) > 0.008:  # > 0.5 deg SO(3) 3D error
                         J = analytical_jacobian(curr_q_live)
                         J_v = J[:3, :]
                         J_w = J[3:, :]
@@ -345,7 +352,7 @@ def run_sync_loop(arm, conn, args):
                         N_v = np.eye(7, dtype=np.float64) - J_v_pinv @ J_v
                         J_w_null = J_w @ N_v
                         J_w_null_pinv = damped_pinv(J_w_null, damping=1e-3)
-                        dq_orient = J_w_null_pinv @ (3.0 * w_tilt)
+                        dq_orient = J_w_null_pinv @ (3.0 * w_rot)
                         dq_orient_norm = np.linalg.norm(dq_orient)
                         if dq_orient_norm > 0.15:
                             dq_orient = dq_orient * (0.15 / dq_orient_norm)
@@ -397,8 +404,9 @@ def run_sync_loop(arm, conn, args):
                     arm.set_joint_velocities(dq_safe)
                 prev_dq = dq_safe.copy()
 
-                # Gripper actuation
-                if grip_cmd > 0.65:
+                # Gripper actuation (configurable sensitivity threshold, default: 0.35)
+                grip_thresh = getattr(args, "grip_thresh", 0.35)
+                if grip_cmd > grip_thresh:
                     close_intent_counter += 1
                     if gripper_state == 0 and close_intent_counter >= args.close_delay_steps:
                         def _do_close():
@@ -408,7 +416,7 @@ def run_sync_loop(arm, conn, args):
                                 rospy.logwarn(f"Gripper close: {e}")
                         threading.Thread(target=_do_close, daemon=True).start()
                         gripper_state = 1
-                elif grip_cmd < 0.35:
+                elif grip_cmd < (grip_thresh * 0.5):
                     close_intent_counter = 0
                     if gripper_state == 1:
                         def _do_open():
@@ -461,6 +469,8 @@ def main():
                         help="Max Newton-Raphson IK solver iterations for recovery (default: 25)")
     parser.add_argument("--close-delay-steps", type=int, default=2,
                         help="Debounce steps before closing gripper (default: 2)")
+    parser.add_argument("--grip-thresh", type=float, default=0.35,
+                        help="Gripper closing activation threshold in [0, 1] (default: 0.35)")
     parser.add_argument("--flip-lr", action="store_true", default=False,
                         help="Invert Joint 0 (base yaw)")
     parser.add_argument("--enable-nullspace", action="store_true", default=False,
