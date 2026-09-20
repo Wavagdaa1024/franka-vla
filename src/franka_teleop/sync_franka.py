@@ -122,7 +122,7 @@ except ImportError:
             self._grip = 0.08
 
 DEFAULT_PORT = 8765
-DEFAULT_SYNC_STEPS = 15       # 15 steps @ 15Hz = 1.000s motion per cycle
+DEFAULT_SYNC_STEPS = 6        # 6 steps @ 15Hz = 0.400s motion per cycle (responsive visual feedback)
 CONTROL_HZ = 15.0             # 15 Hz policy frequency
 DT = 1.0 / CONTROL_HZ         # 0.0667 s
 MAX_JOINT_VEL = 0.35          # 0.35 rad/s max safe testing speed
@@ -361,7 +361,7 @@ def main():
     parser = argparse.ArgumentParser(description="Franka Synchronous (Stop-and-Go) VLA Execution Service")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Listening port (default: 8765)")
     parser.add_argument("--sync-steps", type=int, default=DEFAULT_SYNC_STEPS,
-                        help="Steps per cycle in sync mode (default: 15)")
+                        help="Steps per cycle in sync mode (default: 6, ~0.4s motion)")
     parser.add_argument("--settle-time", type=float, default=0.05,
                         help="Stationary settling time before camera capture (default: 0.05s)")
     parser.add_argument("--max-vel", type=float, default=MAX_JOINT_VEL,
