@@ -11,7 +11,7 @@
    - 运行 Franka 软限位与安全门禁单元测试 (`tests\check_safety_guards.py`)
    - 运行运动学、零空间自稳与 RTC 闭环全套单测 (`tests\test_kinematics_and_rtc.py`，10 项全通)
    - 运行双目相机硬件抽样体检与持续实时流 (`scripts\check_cameras.bat` / `scripts\live_camera.bat`)
-   - 执行真值轨迹对比评测 (`tests\eval_offline_jointpos.py`) 与 Agent 离线自测 (`scripts\run_agent.bat --mock`)
+   - 执行真值轨迹对比评测 (`tests\eval_offline_jointpos.py`) 与 Agent 离线自测 (`scripts\run_sync_agent.bat --mock`)
 
 2. **[02. 遥操作数据采集全流程 (02_teleop_data_collection.md)](02_teleop_data_collection.md)**
    - Franka 控制电脑与 Windows GPU 服务器三终端协同方案
@@ -22,10 +22,10 @@
 
 3. **[03. 实机闭环 VLA 部署四步法 (03_live_vla_deployment.md)](03_live_vla_deployment.md)**
    - 启动 Franka 1kHz 关节速度底层控制器 (`joint_velocity_example_controller.launch`)
-   - 启动 Linux 端闭环执行服务 (`closed_loop_franka_server.py --rtc / --sync`)
-   - Windows GPU 端启动推理主入口 (`scripts\run_agent.bat`，默认加载 50k 纯净流匹配模型)
+   - **方案 A（推荐首选）**：Linux 同步执行 (`sync_franka.py`) + Windows 同步推理 (`scripts\run_sync_agent.bat`)，零拉扯、高精度
+   - **方案 B**：Linux 异步流式 (`closed_loop_franka.py --rtc`) + Windows 异步推理 (`scripts\run_async_agent.bat`)
    - 高性能 HTTP REST 推理微服务与 Web 监控控制台 (`scripts\launch_server.bat 8088 pure_flow`)
-   - 离线 Mock 自检 (`scripts\run_agent.bat --mock`) 与物理急停安全回车启动
+   - 离线 Mock 自检 (`scripts\run_sync_agent.bat --mock`) 与物理急停安全回车启动
 
 4. **[04. 模型训练与微调 (04_model_training.md)](04_model_training.md)**
    - 严格硬件隔离：GPU 1（RTX 5090 32GB）物理单卡全量微调，严禁触碰 GPU 0
