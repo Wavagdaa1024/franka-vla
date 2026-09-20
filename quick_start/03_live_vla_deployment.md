@@ -11,7 +11,7 @@
 | 特性维度 | 方案 A：同步推理 (Stop-and-Go) 【强烈推荐首选】 | 方案 B：异步推理 (RTC 连续流) |
 | :--- | :--- | :--- |
 | **运行脚本 (Windows)** | `scripts\run_sync_agent.bat` | `scripts\run_async_agent.bat` |
-| **服务程序 (Linux)** | `src/franka_teleop/sync_franka.py` | `src/franka_teleop/closed_loop_franka.py --rtc` |
+| **服务程序 (Linux)** | `sync_franka.py` (或 `sync_franka_server.py`) | `closed_loop_franka_server.py --rtc` |
 | **动作衔接协议** | 执行完 15 步后平滑停稳 50ms 再采图 | 边走边预取下一动作分块 |
 | **控制权冲突** | **零冲突**（起步位置与当前真实位置 100% 吻合） | 若时延预估偏差易产生反向拉扯 |
 | **视觉清晰度** | **零运动模糊**（静止采样，抓取定位极准） | 高速运动时可能存在局部模糊 |
@@ -41,7 +41,7 @@ roslaunch franka_example_controllers joint_velocity_example_controller.launch ro
 
 ### 终端 2（Linux 控制电脑）：启动同步执行服务端
 
-新开一个 Linux 终端，进入项目目录并启动同步服务：
+新开一个 Linux 终端，进入控制目录并启动同步服务：
 
 ```bash
 # 激活 ROS 环境
@@ -51,7 +51,7 @@ source /opt/ros/noetic/setup.bash
 cd /home/ssui/project/embodied_midterm/controller_lerobot
 
 # 启动同步执行服务 (桌面硬限高 Z >= 7.0mm)
-python3 src/franka_teleop/sync_franka.py --z-min 0.0070
+python3 sync_franka.py --z-min 0.0070
 ```
 
 > **重要参数说明**：
@@ -59,6 +59,7 @@ python3 src/franka_teleop/sync_franka.py --z-min 0.0070
 > - `--settle-time 0.05`：每个分块执行完毕后停稳 50ms 供相机无模糊采图（默认已启用）。
 > - 姿态控制：已默认关闭任何人工强制竖直，完全由 50k 模型自主掌握位姿。
 > - 终端打印 `[OK] Listening on port 8765. Awaiting GPU Agent...` 表示就绪。
+> - *(注：`python3 sync_franka.py` 与 `python3 src/franka_teleop/sync_franka.py` 均支持)*
 
 ---
 
@@ -112,7 +113,7 @@ roslaunch franka_example_controllers joint_velocity_example_controller.launch ro
 ```bash
 source /opt/ros/noetic/setup.bash
 cd /home/ssui/project/embodied_midterm/controller_lerobot
-python3 src/franka_teleop/closed_loop_franka.py --rtc --z-min 0.0070
+python3 closed_loop_franka_server.py --rtc --z-min 0.0070
 ```
 
 ### 终端 3（Windows GPU 服务器）：启动异步 RTC 推理 Agent
@@ -152,17 +153,20 @@ cd C:\Users\74727\Desktop\project\VLA_franka
 | `pure_flow_2500` | `outputs/.../pi05_lora_pure_flow_50k/step_02500.pt` | 2,500 步中期检查点 |
 | `cartesian_7d` | `outputs/.../pi05_lora_cartesian_7d/pi05_lora_multitask_step_2000.pt` | 历史消融试验模型 |
 
-> **提示**：随时运行 `.\scripts\list_ckpts.bat`，可查看磁盘上所有检查点大小、步数与 LoRA 配置。
-
 ---
 
 ## 常见问题与应急排查
 
-1. **机械臂抖动、拉扯或顿挫？**
-   - **排查 1**：请立即切换至 **方案 A（同步推理模式）**，运行 `run_sync_agent.bat` + `sync_franka.py`。
+1. **`python3: can't open file: No such file or directory`？**
+   - 在 Linux 终端已进入 `/home/ssui/project/embodied_midterm/controller_lerobot` 时，直接运行：
+     `python3 sync_franka.py --z-min 0.0070`
+     *(系统现已建立别名软链，`python3 sync_franka.py` 与 `python3 src/franka_teleop/sync_franka.py` 均支持)*
+
+2. **机械臂抖动、拉扯或顿挫？**
+   - **排查 1**：请切换至 **方案 A（同步推理模式）**，运行 `run_sync_agent.bat` + `sync_franka.py`。
    - **排查 2**：确认 Linux 机器后台没有残留其他节点正在发布 `/joint_velocity_example_controller/joint_velocity`。运行 `rostopic info /joint_velocity_example_controller/joint_velocity` 确认仅有 1 个 Publisher。
    - **排查 3**：确认未加 `--enable-nullspace`（默认已禁用），避免人工外力与模型对抗。
 
-2. **急停与安全退出**：
+3. **急停与安全退出**：
    - 调试暂停：在各终端按下 `Ctrl + C`，控制器会自动平滑制动停臂。
    - 碰撞风险：**立即拍下物理急停开关**！
