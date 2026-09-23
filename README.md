@@ -1,91 +1,113 @@
 # franka-vla: Franka Panda 具身智能 VLA 部署工程
 
-本项目面向 Franka Panda 机械臂具身操作任务，基于 Hugging Face **LeRobot** 规范实现端到端数据采集、Pi0.5 / Gemma LoRA 具身策略微调、三维视觉避障安全滤波与实时 RTC 闭环部署。
+本项目面向 Franka Panda 机械臂具身操作任务，基于 Hugging Face **LeRobot** 规范实现端到端数据采集、Pi0.5 具身策略微调、三维视觉避障安全滤波与实时 RTC 闭环部署。
 
 ---
 
-## 1. 整体目录架构 (Industrial src-layout)
+## 🚀 核心代码入口 (Core Entry Points)
+
+日常所有核心任务（实机闭环、模型训练、遥操作录制、控制服务）均已封装为标准入口脚本，请按需调用：
+
+### 1. 实机闭环推理 (Inference & Autonomous Control)
+
+> **核心实现**：`scripts/python/sync_vla_agent.py`（同步模式） / `scripts/python/async_rtc_vla_agent.py`（异步模式）
+
+* **同步推理 (Stop-and-Go，推荐首选)**
+  ```cmd
+  scripts\run_sync_agent.bat
+  :: 或使用统一总入口：
+  scripts\run_agent.bat
+  ```
+  * **特点**：动作分块执行完毕后平滑停稳 50ms 采图，彻底消除运动模糊与时间戳竞态，抓取定位精度最高。
+  * **硬件绑定**：GPU 1 (RTX 5090 32GB)
+  * **默认权重**：`outputs\checkpoints\pi05_lora_pure_flow_50k\latest.pt`
+
+* **异步 RTC 推理 (Real-Time Chunking)**
+  ```cmd
+  scripts\run_async_agent.bat
+  ```
+  * **特点**：滚动时域平滑衔接（Receding Horizon），连续流动控制，适合大范围平滑移动。
+
+* **独立推理服务 (High-Performance Server)**
+  ```cmd
+  scripts\launch_server.bat 8088 pure_flow
+  ```
+  * **底层脚本**：`scripts/python/vla_inference_server.py`
+  * **特点**：将 Pi0.5 模型作为独立常驻服务部署于 GPU 1，支持客户端通过网络高并发调用。
+
+---
+
+### 2. 具身策略微调与训练 (Policy Training)
+
+> **核心实现**：`scripts/python/train_pi05_lora.py`
+
+* **50,000 步纯净流匹配微调 (Canonical 50k Pure Flow)**
+  ```cmd
+  scripts\train_pure_flow_50k_gpu1.bat
+  ```
+  * **特点**：100% 原生纯净关节流匹配（Loss Mode: `pure_flow`），带 LoRA Dropout 与 WandB 云端实时指标监控。
+  * **硬件资源**：物理 GPU 1 (RTX 5090 32GB)
+
+* **20,000 步视野裁剪微调 (Crop 16:9)**
+  ```cmd
+  scripts\train_crop169_20k_gpu1.bat
+  ```
+
+* **自定义训练命令行**
+  ```cmd
+  python scripts/python/train_pi05_lora.py ^
+      --dataset dataset\teleop_pick_cube_15hz_004 ^
+      --output-dir outputs\checkpoints\my_pi05_lora ^
+      --steps 20000 --loss-mode pure_flow
+  ```
+
+---
+
+### 3. 真机遥操作与数据录制 (Teleoperation & Data Collection)
+
+> **核心实现**：`src/franka_teleop/record_teleop.py`
+
+* **实机数据同步录制**
+  ```cmd
+  scripts\launch_record.bat
+  ```
+  * **特点**：15Hz 同步采集 Franka 机械臂状态与双目 RealSense 相机画面（Front 视角 + Wrist 腕部视角），自动分切并保存为标准 LeRobot / Parquet 数据集格式。
+
+---
+
+### 4. 机械臂控制与安全服务 (Robot Controller & Safety Guard)
+
+> **核心实现**：`src/franka_teleop/sync_franka.py` / `src/franka_teleop/closed_loop_franka.py`
+
+* **Linux 控制端启动同步服务端**
+  ```bash
+  # 必须在原生 ROS 环境中执行 (Linux 控制主机 10.197.16.43)
+  source /opt/ros/noetic/setup.bash
+  cd /home/ssui/project/embodied_midterm/controller_lerobot
+  python3 sync_franka.py --z-min 0.0070
+  ```
+  * **安全特性**：硬编码桌面安全底面（$Z \ge +7.0\text{ mm}$ 防撞保护）、末端姿态垂直对齐、关节速度限幅与急停刹车平滑过滤。
+
+---
+
+## 📁 项目关键目录架构
 
 ```text
 franka-vla/
-├── src/                                  <-- 【功能性代码核心统一目录】
-│   ├── franka_teleop/                    <-- 机械臂驱动、RTC闭环服务、Pi0.5引擎、正逆运动学
-│   ├── obstacle_avoidance/               <-- 3D包络感知、Franka胶囊碰撞体、实时安全滤波
-│   └── vlm_planning/                     <-- 大模型任务规划、目标定位与三维空间坐标映射
-│
-├── tests/                                <-- 【测试与标定统一目录】
-│   ├── camera_alignment/                 <-- 相机复位与手眼对齐子模块 (ChArUco 6-DoF + Web服务)
-│   │   ├── align_front_camera.py
-│   │   ├── launch_align_camera.bat
-│   │   ├── query_d435_extrinsics.py
-│   │   ├── extract_camera_pairs.py
-│   │   ├── tag_charuco_4x4_printable.png
-│   │   └── README.md
-│   ├── check_cameras.py                  <-- 双摄硬件抽样体检与序列号排查
-│   ├── check_safety_guards.py            <-- 机械臂软硬件限位与滤波自检
-│   ├── check_datasets.py                 <-- LeRobot 数据集规范合规检查
-│   ├── test_kinematics_and_rtc.py        <-- 运动学、零空间自稳与闭环控制单测 (10项全通)
-│   └── test_differentiable_fk.py         <-- 可微正向运动学 (DFK) 梯度求导单测
-│
-├── scripts/                              <-- 【用户统一操作入口层 (一键批处理)】
-│   ├── python/                           <-- 【底层核心 Python 脚本模块】
-│   │   ├── async_rtc_vla_agent.py        <-- 实机/模拟 VLA 异步推理核心
-│   │   ├── train_pi05_lora.py            <-- Pi0.5 LoRA 微调训练引擎
-│   │   ├── live_camera_stream.py         <-- 双摄持续实时流与 Web 推流
-│   │   └── list_ckpts.py                 <-- 训练检查点结构化扫描查询
-│   ├── run_agent.bat                     <-- 实机推理主入口 (绑定 GPU 1, 默认 Step 1500 权重)
-│   ├── train_cartesian_lora_gpu0.bat     <-- DFK LoRA 训练入口 (绑定 GPU 0, 姿态锁死防滑移)
-│   ├── train_red_cube_lora_gpu0.bat      <-- 纯关节 LoRA 训练入口 (绑定 GPU 0)
-│   ├── live_camera.bat                   <-- 双摄持续监控入口 (OpenCV 窗口 + HTTP Web:8080)
-│   ├── check_cameras.bat                 <-- 双摄硬件快速体检 (采样 15 帧核验)
-│   ├── align_camera.bat                  <-- 相机复位与手眼对齐入口 (转发至 tests/camera_alignment)
-│   ├── launch_record.bat                 <-- 真机遥操作录制
-│   └── list_ckpts.bat                    <-- 检查点清单一键查询
-│
-├── outputs/                              <-- 训练权重、测试日志、提取切片 (已被 .gitignore 保护)
-├── dataset/                              <-- 官方格式轨迹数据集 (已被 .gitignore 保护)
-├── docs/                                 <-- 架构与安全文档 (docs/ARCHITECTURE.md, docs/SAFETY_RULES.md)
-├── quick_start/                          <-- 分步操作指南
-└── pyproject.toml                        <-- 规范包配置 (where = ["src"])
+├── src/                                  # 核心源码
+│   ├── franka_teleop/                    # 机械臂驱动、RTC闭环服务、Pi0.5引擎、正逆运动学
+│   ├── obstacle_avoidance/               # 3D包络感知、Franka胶囊碰撞体、实时安全滤波
+│   └── vlm_planning/                     # 大模型任务规划与目标空间映射
+├── scripts/                              # 用户操作统一入口层
+│   ├── run_sync_agent.bat                # 【实机推理】同步模式首选入口
+│   ├── run_async_agent.bat               # 【实机推理】异步RTC流动入口
+│   ├── launch_server.bat                 # 【推理服务】常驻后台推理服务
+│   ├── train_pure_flow_50k_gpu1.bat      # 【模型训练】50k步Pure Flow训练入口
+│   ├── train_crop169_20k_gpu1.bat        # 【模型训练】20k步裁剪微调入口
+│   ├── launch_record.bat                 # 【数据采集】遥操作数据同步录制
+│   └── python/                           # 底层 Python 实现脚本
+├── tests/                                # 单元测试与标定工具
+├── outputs/                              # 训练权重与日志 (已加入 .gitignore)
+├── dataset/                              # 轨迹数据集 (已加入 .gitignore)
+└── quick_start/                          # 分步部署详细教程
 ```
-
----
-
-## 2. 用户操作统一入口 (`scripts/`)
-
-日常所有操作均可通过 `scripts\` 下的批处理一键执行，无需手动切换深层路径或配置复杂的 Conda/CUDA 环境变量：
-
-| 场景 | 推荐命令 | 作用说明 | 硬件资源 |
-| :--- | :--- | :--- | :---: |
-| **实机推理 (推荐首选)** | `scripts\run_agent.bat --raw --checkpoint cartesian_1000` | 运行 DFK 笛卡尔 LoRA (Tilt=0.5°)，无生硬后处理，端到端执行抓取 | GPU 1 (RTX 5090) |
-| **实机推理 (安全滤波)** | `scripts\run_agent.bat --rtc --checkpoint cartesian_1000` | 开启零空间姿态自稳与实时速度平滑滤波 | GPU 1 (RTX 5090) |
-| **推理虚跑自检** | `scripts\run_agent.bat --mock --checkpoint cartesian_1000` | GPU 1 模型加载自测，不连机械臂与摄像头 | GPU 1 (RTX 5090) |
-| **模型微调训练** | `scripts\train_cartesian_lora_gpu0.bat` | GPU 0 训练带 DFK 笛卡尔空间损失与垂直向下倾角约束的 LoRA | GPU 0 (独立运行) |
-| **双摄实时监控** | `scripts\live_camera.bat --web` | 打开双目相机实时流，浏览器访问 `http://localhost:8080` 查看 | CPU / USB |
-| **双摄硬件体检** | `scripts\check_cameras.bat` | 快速捕获 15 帧排查掉帧、色彩与设备序列号 | CPU / USB |
-| **相机复位与标定** | `scripts\align_camera.bat` | 运行 ChArUco 6-DoF 相机快速复位与半透明叠图 (Web: `8088`) | CPU / RealSense |
-| **真机数据录制** | `scripts\launch_record.bat` | 实机遥操数据同步录制入口 | Franka + RealSense |
-| **权重清单查询** | `scripts\list_ckpts.bat` | 打印当前服务器所有训练完成的 Checkpoints 路径与步数 | 本地查询 |
-
----
-
-## 3. 核心功能模块划分说明
-
-1. **`src/franka_teleop/`**：
-   - 机器人底层硬件驱动、TCP 通信协议包、实时 RTC (Real-Time Chunking) 连续闭环控制服务、Pi0.5 模型引擎与可微正向运动学（DFK）。
-2. **`src/obstacle_avoidance/`**：
-   - 视觉空间安全包络提取（Perception Envelope）、机械臂 9 胶囊体模型（Franka Capsule Model）与障碍物最小距离解析计算引擎。
-3. **`src/vlm_planning/`**：
-   - 多步骤大模型任务规划器（Qwen / RoboBrain）与桌面二维/三维坐标投影映射。
-4. **`tests/camera_alignment/`**：
-   - 第三视角相机防碰撞偏移 6-DoF 快速复位系统、ChArUco 标定板高清图纸及数据集双摄同步切片提取工具。
-
----
-
-## 4. 快速分步教程
-
-详细分步操作手册请参阅 **[quick_start/ 教程目录](quick_start/)**：
-- [01. 离线环境与安全自检](quick_start/01_offline_sanity_checks.md)
-- [02. 遥操作数据采集全流程](quick_start/02_teleop_data_collection.md)
-- [03. 实机闭环 VLA 部署四步法](quick_start/03_live_vla_deployment.md)
-- [04. 模型训练与微调](quick_start/04_model_training.md)
