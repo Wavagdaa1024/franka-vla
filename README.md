@@ -1,113 +1,119 @@
 # franka-vla: Franka Panda 具身智能 VLA 部署工程
 
-本项目面向 Franka Panda 机械臂具身操作任务，基于 Hugging Face **LeRobot** 规范实现端到端数据采集、Pi0.5 具身策略微调、三维视觉避障安全滤波与实时 RTC 闭环部署。
+本项目面向 **Franka Panda** 机械臂具身操作任务，基于 Hugging Face **LeRobot** 规范实现端到端数据采集、Pi0.5 策略微调（LoRA）、三维工作空间安全防护与实时闭环推理部署。
+
+---
+
+## 🏗️ 整体系统架构与工作流
+
+系统采用“**GPU 算力工作站 + 实时机械臂控制电脑**”双机协同架构：
+
+```text
+               ┌─────────────────────────────────────────────────────┐
+               │              Windows GPU 推理工作站                  │
+               │   (RTX 5090 32GB / Python / PyTorch / Pi0.5 LoRA)   │
+               └───────────────▲─────────────────────▲───────────────┘
+                               │                     │
+                    (双目图像 Front+Wrist)       (15Hz 动作分块 Chunk)
+                               │                     │
+               ┌───────────────┴─────────────────────┴───────────────┐
+               │               Linux 机械臂控制主机                   │
+               │         (Ubuntu 20.04 / ROS Noetic / 1kHz)          │
+               └─────────────────────────▲───────────────────────────┘
+                                         │
+                                  (libfranka 驱动)
+                                         │
+                               ┌─────────┴─────────┐
+                               │ Franka Panda 机械臂│
+                               └───────────────────┘
+```
 
 ---
 
 ## 🚀 核心代码入口 (Core Entry Points)
 
-日常所有核心任务（实机闭环、模型训练、遥操作录制、控制服务）均已封装为标准入口脚本，请按需调用：
+仓库核心功能已高度收敛封装，日常运行只需关注以下 4 个最关键入口：
 
-### 1. 实机闭环推理 (Inference & Autonomous Control)
-
-> **核心实现**：`scripts/python/sync_vla_agent.py`（同步模式） / `scripts/python/async_rtc_vla_agent.py`（异步模式）
-
-* **同步推理 (Stop-and-Go，推荐首选)**
-  ```cmd
-  scripts\run_sync_agent.bat
-  :: 或使用统一总入口：
-  scripts\run_agent.bat
-  ```
-  * **特点**：动作分块执行完毕后平滑停稳 50ms 采图，彻底消除运动模糊与时间戳竞态，抓取定位精度最高。
-  * **硬件绑定**：GPU 1 (RTX 5090 32GB)
-  * **默认权重**：`outputs\checkpoints\pi05_lora_pure_flow_50k\latest.pt`
-
-* **异步 RTC 推理 (Real-Time Chunking)**
-  ```cmd
-  scripts\run_async_agent.bat
-  ```
-  * **特点**：滚动时域平滑衔接（Receding Horizon），连续流动控制，适合大范围平滑移动。
-
-* **独立推理服务 (High-Performance Server)**
-  ```cmd
-  scripts\launch_server.bat 8088 pure_flow
-  ```
-  * **底层脚本**：`scripts/python/vla_inference_server.py`
-  * **特点**：将 Pi0.5 模型作为独立常驻服务部署于 GPU 1，支持客户端通过网络高并发调用。
+| 任务场景 | 核心入口脚本 / 命令 | 底层实现文件 | 说明与关键特性 |
+| :--- | :--- | :--- | :--- |
+| **1. 实机自主推理 (首选)** | `scripts\run_sync_agent.bat` | `scripts/python/sync_vla_agent.py` | **Stop-and-Go 同步执行**：执行后停稳50ms无模糊采图，高精抓取首选 |
+| **1.1 实机推理 (RTC 流动)** | `scripts\run_async_agent.bat` | `scripts/python/async_rtc_vla_agent.py` | **异步 RTC 模式**：滚动时域衔接，适合大范围平滑连续移动 |
+| **1.2 独立推理服务** | `scripts\launch_server.bat` | `scripts/python/vla_inference_server.py` | GPU 1 常驻模型推理服务，供客户端通过网络远程调用 |
+| **2. 模型微调训练** | `scripts\train_pure_flow_50k_gpu1.bat` | `scripts/python/train_pi05_lora.py` | 50,000 步纯净流匹配微调，带 LoRA Dropout 与 WandB 监控 |
+| **3. 遥操作数据采集** | `scripts\launch_record.bat` | `src/franka_teleop/record_teleop.py` | 15Hz 同步录制机械臂关节与双摄画面，自动输出 LeRobot 格式 |
+| **4. 控制端底层服务** | `python3 sync_franka.py --z-min 0.0070` | `src/franka_teleop/sync_franka.py` | Linux 端 ROS 服务，内置 $Z \ge 7\text{mm}$ 防撞保护与垂直姿态锁定 |
 
 ---
 
-### 2. 具身策略微调与训练 (Policy Training)
+## ⚡ 三步上手流程 (Quickstart)
 
-> **核心实现**：`scripts/python/train_pi05_lora.py`
+### 第一步：在 Linux 控制主机启动机械臂服务
 
-* **50,000 步纯净流匹配微调 (Canonical 50k Pure Flow)**
-  ```cmd
-  scripts\train_pure_flow_50k_gpu1.bat
-  ```
-  * **特点**：100% 原生纯净关节流匹配（Loss Mode: `pure_flow`），带 LoRA Dropout 与 WandB 云端实时指标监控。
-  * **硬件资源**：物理 GPU 1 (RTX 5090 32GB)
+```bash
+# 激活 ROS 环境并进入控制目录 (位于 10.197.16.43 控制电脑)
+source /opt/ros/noetic/setup.bash
+cd /home/ssui/project/embodied_midterm/controller_lerobot
 
-* **20,000 步视野裁剪微调 (Crop 16:9)**
-  ```cmd
-  scripts\train_crop169_20k_gpu1.bat
-  ```
+# 启动底层关节速度控制器与安全同步服务
+roslaunch franka_example_controllers joint_velocity_example_controller.launch robot_ip:=172.16.0.2
+python3 sync_franka.py --z-min 0.0070
+```
 
-* **自定义训练命令行**
-  ```cmd
-  python scripts/python/train_pi05_lora.py ^
-      --dataset dataset\teleop_pick_cube_15hz_004 ^
-      --output-dir outputs\checkpoints\my_pi05_lora ^
-      --steps 20000 --loss-mode pure_flow
-  ```
+### 第二步（可选）：数据录制与模型训练
 
----
-
-### 3. 真机遥操作与数据录制 (Teleoperation & Data Collection)
-
-> **核心实现**：`src/franka_teleop/record_teleop.py`
-
-* **实机数据同步录制**
+* **录制新任务数据**（连接双目 RealSense 与示教夹爪）：
   ```cmd
   scripts\launch_record.bat
   ```
-  * **特点**：15Hz 同步采集 Franka 机械臂状态与双目 RealSense 相机画面（Front 视角 + Wrist 腕部视角），自动分切并保存为标准 LeRobot / Parquet 数据集格式。
-
----
-
-### 4. 机械臂控制与安全服务 (Robot Controller & Safety Guard)
-
-> **核心实现**：`src/franka_teleop/sync_franka.py` / `src/franka_teleop/closed_loop_franka.py`
-
-* **Linux 控制端启动同步服务端**
-  ```bash
-  # 必须在原生 ROS 环境中执行 (Linux 控制主机 10.197.16.43)
-  source /opt/ros/noetic/setup.bash
-  cd /home/ssui/project/embodied_midterm/controller_lerobot
-  python3 sync_franka.py --z-min 0.0070
+* **一键启动策略微调**（在 GPU 1 上训练 50k 步）：
+  ```cmd
+  scripts\train_pure_flow_50k_gpu1.bat
   ```
-  * **安全特性**：硬编码桌面安全底面（$Z \ge +7.0\text{ mm}$ 防撞保护）、末端姿态垂直对齐、关节速度限幅与急停刹车平滑过滤。
+
+### 第三步：在 Windows 工作站启动实机闭环推理
+
+```cmd
+:: 运行默认同步推理（自动加载 50k 步最新检查点并连接控制端）
+scripts\run_sync_agent.bat
+
+:: 或者统一调度总入口：
+scripts\run_agent.bat
+```
 
 ---
 
-## 📁 项目关键目录架构
+## 📁 目录架构导航
 
 ```text
 franka-vla/
-├── src/                                  # 核心源码
-│   ├── franka_teleop/                    # 机械臂驱动、RTC闭环服务、Pi0.5引擎、正逆运动学
-│   ├── obstacle_avoidance/               # 3D包络感知、Franka胶囊碰撞体、实时安全滤波
-│   └── vlm_planning/                     # 大模型任务规划与目标空间映射
-├── scripts/                              # 用户操作统一入口层
-│   ├── run_sync_agent.bat                # 【实机推理】同步模式首选入口
-│   ├── run_async_agent.bat               # 【实机推理】异步RTC流动入口
-│   ├── launch_server.bat                 # 【推理服务】常驻后台推理服务
-│   ├── train_pure_flow_50k_gpu1.bat      # 【模型训练】50k步Pure Flow训练入口
-│   ├── train_crop169_20k_gpu1.bat        # 【模型训练】20k步裁剪微调入口
+├── src/                                  # 核心系统源码
+│   ├── franka_teleop/                    # 机械臂驱动、RTC 闭环通信、Pi0.5 引擎与正逆运动学
+│   ├── obstacle_avoidance/               # 视觉包络提取、机械臂胶囊模型与实时避障滤波
+│   └── vlm_planning/                     # 大模型（Qwen / RoboBrain）空间规划与目标映射
+├── scripts/                              # 用户操作一键批处理层
+│   ├── run_sync_agent.bat                # 【实机推理】同步执行首选入口
+│   ├── run_async_agent.bat               # 【实机推理】异步连续流入口
+│   ├── launch_server.bat                 # 【服务部署】独立推理服务
+│   ├── train_pure_flow_50k_gpu1.bat      # 【微调训练】50k 步纯净流训练入口
+│   ├── train_crop169_20k_gpu1.bat        # 【微调训练】20k 步视场裁剪微调入口
 │   ├── launch_record.bat                 # 【数据采集】遥操作数据同步录制
-│   └── python/                           # 底层 Python 实现脚本
-├── tests/                                # 单元测试与标定工具
-├── outputs/                              # 训练权重与日志 (已加入 .gitignore)
-├── dataset/                              # 轨迹数据集 (已加入 .gitignore)
-└── quick_start/                          # 分步部署详细教程
+│   └── python/                           # 底层 Python 实现脚本库
+├── quick_start/                          # 详细步骤文档 (01环境检查 ~ 04微调实操)
+├── tests/                                # 算法单测与相机 ChArUco 手眼标定工具
+├── dataset/                              # 录制轨迹数据集 (LeRobot / Parquet 规范)
+└── outputs/                              # 模型 Checkpoints 权重与推理评测日志
 ```
+
+---
+
+## 📋 运行依赖与环境
+
+* **Windows GPU 推理端**：
+  * Python 3.10+ (推荐 Conda `lerobot` 环境)
+  * PyTorch 2.2+, CUDA 12.x
+  * NVIDIA RTX 4090 / 5090 (建议显存 $\ge$ 24GB)
+  * RealSense SDK (`pyrealsense2`), OpenCV, Accelerate
+* **Linux 机械臂控制端**：
+  * Ubuntu 20.04 LTS
+  * ROS Noetic (`rospy`, `sensor_msgs`, `franka_ros`)
+  * `libfranka` 0.8.0+
