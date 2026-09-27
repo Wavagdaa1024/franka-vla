@@ -1,0 +1,16 @@
+{
+  " timestamp\: \2026-09-12T21:24:55+08:00\,
+ \description\: \User teleoperated Franka closer ready pose for tabletop manipulation\,
+ \cartesian_pose\: {
+ \position\: {
+ \x\: 0.4753,
+ \y\: 0.0078,
+ \z\: 0.1815
+ },
+ \orientation_quaternion_xyzw\: [0.9998, -0.0113, -0.014, -0.011]
+ },
+ \joint_positions_rad\: [-0.0802, 0.0305, 0.0914, -2.4492, 0.0313, 2.4519, 0.7947],
+ \joint_positions_deg\: [-4.60, 1.75, 5.24, -140.33, 1.79, 140.48, 45.53],
+ \gripper_width_m\: 0.08069,
+ \gripper_state\: \OPEN\
+}
